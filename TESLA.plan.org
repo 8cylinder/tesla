@@ -1,0 +1,434 @@
+#+TITLE: Tesla CLI --- Project Plan
+#+FILETAGS: :tesla:plan:
+#+STARTUP: overview indent
+#+OPTIONS: toc:2 num:nil
+#+TODO: TODO NEXT WAIT | DONE CANCELLED
+
+* Overview
+Build a Python CLI called =tesla= that reads Tesla car and Powerwall
+state through the Tesla Fleet API using
+[[https://github.com/Teslemetry/python-tesla-fleet-api][python-tesla-fleet-api]]. The first use case is to watch the Powerwall
+and start car charging once the Powerwall reaches 100%. More commands
+will be added later.
+
+The project is managed with [[https://docs.astral.sh/uv/][uv]] and always tracks
+the latest =tesla-fleet-api= release; its current Python floor is 3.13.
+
+* Scope (v0.1)
+- Authentication against the Fleet API, usable from a headless server.
+- Read-only status commands for vehicles and energy sites.
+- A watch loop that polls the Powerwall and triggers =charge_start= on
+  the car when the configured threshold is met.
+- Manual car charging commands.
+- A structure that makes adding future commands cheap.
+
+Out of scope for v0.1 (possible follow-ups): telemetry streaming,
+BLE, scheduling, multiple vehicles/sites, notifications, web UI.
+
+* Decisions
+| Topic             | Decision                                                                                      |
+|-------------------+-----------------------------------------------------------------------------------------------|
+| Python            | =3.13= --- floor required by the latest =tesla-fleet-api=; uv owns the interpreter                |
+| Dependencies      | Track latest =tesla-fleet-api= (>= 1.15); commit =uv.lock=; bump the Python floor with it         |
+| Region            | =na=                                                                                            |
+| Developer app     | One-time registration at =developer.tesla.com/request=; $10/month personal credit; scopes below |
+| Command transport | Config toggle =fleet= (unsigned) / =signed=; default =signed=                                   |
+| Read path         | =vehicle_data(endpoints=["charge_state"])= for both transports; =charge_state()= is BLE-only      |
+| Watch behavior    | Trigger once, then exit                                                                       |
+| Secret storage    | =config.toml= (0644) + =tokens.json= (0600), client ID/secret from env or =.env=                    |
+| CLI framework     | Click                                                                                         |
+| Poll interval     | 300 s default, configurable                                                                   |
+| Backoff           | 5 s initial, x2, cap 300 s, +/-20% jitter, give up after 5 consecutive failures               |
+| Distribution name | =tesla-cli= (module and executable: =tesla=); pyproject says =tesla= today, fix in M1               |
+| Error handling    | Catch =TeslaFleetError= explicitly --- it subclasses =BaseException=, not =Exception=               |
+
+* Tesla developer app (one-time setup)
+Authentication requires a Tesla developer application registered to the
+same Tesla account that owns the car and Powerwall. Steps (see
+[[https://developer.tesla.com/request][developer.tesla.com/request]]):
+
+1. [ ] Tesla account with a verified email, owning the vehicle and Powerwall.
+2. [ ] Create the application, then copy the Client ID and Client Secret
+   (dashboard -> View Details -> Credentials & APIs):
+   - OAuth grant type: *Authorization Code and Machine-to-Machine*
+     (required for refresh tokens).
+   - Allowed origin: =https://8cylinder.com= (scheme + host only, no
+     path). It need not point at this server; in signed mode it is the
+     public-key host.
+   - Allowed redirect URI: =http://localhost:8085/callback= (localhost
+     is exempt from Tesla's HTTPS redirect rule).
+   - Scopes: the list below.
+3. [ ] Billing: personal use includes a $10/month credit; vehicle data and
+   command calls draw it down while energy-product APIs are free. A
+   payment method is only needed if usage exceeds the credit; the
+   developer dashboard shows current usage.
+4. [ ] Signed commands only (=fleet= mode skips this, newer vehicles and any
+   long-term path require it):
+   - Generate an EC P-256 key (=tesla key generate=, library
+     =await get_private_key(path)=).
+   - Host the public key at
+     =https://8cylinder.com/.well-known/appspecific/com.tesla.3p.public-key.pem=.
+     Keep it online permanently: registration and pairing fetch it, and
+     re-pairing or adding vehicles later needs the same URL live.
+   - Register the domain with Tesla
+     (=oauth.partner.register("8cylinder.com")=).
+   - Pair the virtual key per vehicle: open
+     =https://tesla.com/_ak/8cylinder.com= on a phone with the Tesla app.
+   - Trust model: the private host only makes outbound HTTPS calls to
+     Tesla; the public host only serves the key. Tesla and the vehicle
+     use it at registration/pairing, after which the key lives in the
+     vehicle's whitelist and is not re-fetched per command.
+   - If pairing proves impossible, unsigned =fleet= mode remains the
+     fallback.
+
+* Headless OAuth
+The server has SSH only, no browser and no public ingress. Use *manual
+code paste*:
+
+1. Register redirect URI =http://localhost:8085/callback= in the Tesla
+   developer app (localhost is exempt from Tesla's HTTPS redirect rule).
+2. Run =tesla auth login=; it builds the URL with
+   =oauth.get_login_url(scopes)= and prints it.
+3. Open that URL on any phone/laptop, log in, and authorize.
+4. The browser redirects to
+   http://localhost:8085/callback?code=na_...&state=... and fails to
+   load --- that is expected.
+5. Copy the full address-bar URL (or just the =code=) and paste it back
+   into the terminal. Tesla authorization codes are short-lived; paste
+   promptly.
+6. The CLI extracts =code= and calls
+   =await oauth.get_refresh_token(code)=, then persists =.refresh_token=
+   and =.expires=. The access token itself is never written to disk.
+
+Constructor reference (verified against 1.15.0):
+
+#+begin_src python
+TeslaFleetOAuth(session, region="na", client_id=..., client_secret=..., redirect_uri=...)
+#+end_src
+
+=TeslaFleetOAuth= subclasses =TeslaFleetApi=, so the same object is also
+the API root: =oauth.products()=, =oauth.vehicles=, =oauth.energySites=,
+=oauth.partner=. One session/object serves auth and calls.
+
+Optional =tesla auth login --listen= runs a one-shot localhost callback
+server for users who can =ssh -L 8085:localhost:8085 server=. Both paths
+write the same token file.
+
+Requested scopes:
+
+#+begin_src python
+["openid", "offline_access", "vehicle_device_data", "vehicle_cmds",
+ "vehicle_charging_cmds", "energy_device_data"]
+#+end_src
+
+=vehicle_cmds= is included for =wake_up()=; add =user_data= if
+=products()= returns 403 (verify during M2).
+
+* Architecture
+#+begin_src
+tesla/
+├── pyproject.toml            # [project.scripts] tesla = "tesla.cli:main"
+├── uv.lock
+├── README.md                 # setup, auth, systemd, troubleshooting
+├── .env.example              # TESLA_CLIENT_ID / TESLA_CLIENT_SECRET / TESLA_REDIRECT_URI
+├── .gitignore
+├── .github/workflows/ci.yml  # ruff + pytest (M6)
+├── src/tesla/
+│   ├── __init__.py           # __version__ via importlib.metadata
+│   ├── __main__.py           # python -m tesla
+│   ├── cli.py                # Click command groups, asyncio.run wrappers
+│   ├── config.py             # TOML settings, paths, env precedence
+│   ├── tokens.py             # refresh token + expiry persistence (0600, atomic)
+│   ├── client.py             # aiohttp session, TeslaFleetOAuth, vehicle/site factories
+│   ├── powerwall.py          # live_status -> percentage_charged (ratio fallback)
+│   ├── car.py                # charge_state read, plug detection, wake, start/stop/limit
+│   ├── auto_charge.py        # pure decision logic + watch loop
+│   └── logging.py            # stdlib logging setup (-v / --log-file)
+└── tests/
+    ├── conftest.py           # fake client/session fixtures, tmp config dirs
+    ├── test_config.py
+    ├── test_tokens.py
+    ├── test_powerwall.py
+    ├── test_car.py
+    ├── test_auto_charge.py
+    └── test_cli.py           # Click CliRunner
+#+end_src
+
+Dependencies: latest =tesla-fleet-api= (>= 1.15), =aiohttp=, =click=, =rich=,
+optional =python-dotenv=. Dev group: =pytest=, =pytest-asyncio=, =ruff=. Note
+that =tesla-fleet-api= pulls in =cryptography=, =protobuf=, =tesla-protocol=,
+=bleak= and =aiolimiter= even though v0.1 never uses BLE.
+
+Client factory notes:
+- =oauth.vehicles.createFleet(vin)= (unsigned) or
+  =oauth.vehicles.createSigned(vin)= (signed protocol).
+- =oauth.energySites.create(energy_site_id)= -> =EnergySite=.
+- Signed mode requires =await oauth.get_private_key(path)= (creates an
+  EC P-256 key at 0600 if absent) and key pairing; see M6.
+
+* Configuration and tokens
+=~/.config/tesla/config.toml=:
+
+#+begin_src toml
+region = "na"
+
+[vehicle]
+vin = "5YJ..."
+command_mode = "signed"       # or "fleet" (unsigned fallback)
+key_path = "~/.config/tesla/private_key.pem"
+
+[powerwall]
+energy_site_id = 123456789
+
+[auto_charge]
+threshold = 100.0
+poll_interval_seconds = 300
+require_plugged = true
+wake_timeout_seconds = 90
+set_charge_limit = 0          # 0 = leave unchanged
+max_runtime_hours = 0         # 0 = unlimited
+#+end_src
+
+=~/.config/tesla/tokens.json= (mode 0600):
+
+#+begin_src json
+{"refresh_token": "...", "expires": 1234567890}
+#+end_src
+
+- Writes go to a temp file in the same directory then =os.replace=, so a
+  crash cannot truncate the token file; mode is enforced 0600 on create
+  and checked (with a clear error) on read.
+- Tesla rotates the refresh token on every refresh, so =check_access_token()=
+  usually returns a new token that must be persisted before the next call.
+- =auth status= and the long-running service must not run concurrently,
+  or the loser will hold a revoked token; the lock file guards this.
+- Credentials precedence: CLI flag -> environment variable -> =.env= ->
+  error. Secrets are never logged.
+- Unknown keys and wrong types are rejected with a clear message;
+  =tesla config show= prints the effective (redacted) config.
+
+* CLI surface (v0.1)
+| Command                                | Purpose                                                |
+|----------------------------------------+--------------------------------------------------------|
+| =tesla auth login [--listen]=            | Headless OAuth; saves refresh token                    |
+| =tesla auth status=                      | Token validity, refreshes if needed, persists rotation |
+| =tesla products=                         | List vehicles and energy sites with VIN/site IDs       |
+| =tesla powerwall status [--watch]=       | =percentage_charged=, reserve, grid status               |
+| =tesla car status=                       | Battery %, charging state, plugged, charge limit       |
+| =tesla car charge start / stop=          | Manual charging commands                               |
+| =tesla car charge limit <pct>=           | Set charge limit (0-100 validation)                    |
+| =tesla auto-charge [flags]=              | Main watch loop                                        |
+| =tesla config show / set=                | View/update config                                     |
+| =tesla key generate / register / status= | EC key creation; =partner.register()=; =fleet_status()=    |
+| =tesla doctor=                           | Validate config, auth, connectivity, IDs, scopes       |
+| =tesla --version=                        | =importlib.metadata.version("tesla-cli")=                |
+
+=auto-charge= flags: =--threshold N=, =--interval S=, =--dry-run=, =--once=.
+=--once= performs a single evaluation pass and exits instead of looping
+(logs the decision but does not sleep); =--dry-run= never sends commands.
+
+* Core flow: auto-charge
+1. Load config, acquire the lock file, refresh the access token if
+   expired: =check_access_token()= returns a dict (=refresh_token=,
+   =expires=) when it refreshed, else =None=; persist atomically.
+   =OAuthExpired= / =InvalidToken= / =LoginRequired= -> exit 2 with a
+   "re-run =tesla auth login=" message.
+2. Build objects: fleet -> =oauth.vehicles.createFleet(vin)=; signed ->
+   =createSigned(vin)= after =get_private_key(key_path)=; always
+   =oauth.energySites.create(site_id)=.
+3. Loop every =poll_interval_seconds=:
+   1. =live_status()= -> =percentage_charged=; if missing compute
+      =energy_left / total_pack_energy * 100=; if unavailable, log and
+      continue.
+   2. Below threshold -> log and sleep.
+   3. At/above threshold -> read car charge state with
+      =vehicle_data(endpoints=["charge_state"])= (both transports;
+      =vehicle_data= is a plain read, signing only affects commands):
+      - Already =Charging= or =Complete= -> exit 0, nothing to do.
+      - =Disconnected= and =require_plugged= -> log "waiting for plug"
+        and continue polling.
+      - Otherwise wake (=wake_up()=, then poll =vehicle()= until
+        =state == "online"= or =wake_timeout_seconds=), optionally
+        =set_charge_limit(n)=, then =charge_start()=.
+   4. Verify with a follow-up =vehicle_data= read that
+      =charging_state == "Charging"= (or =Complete=), log, and exit.
+4. Exit codes: 0 triggered / nothing to do, 2 config or auth error,
+   3 API or vehicle error. =--dry-run= logs the decision without sending
+   commands (no wake, no commands).
+5. SIGINT/SIGTERM handler for clean systemd stop; single-instance lock
+   file so two loops cannot run.
+
+** decide() truth table
+=auto_charge.decide(powerwall_pct, charging_state, require_plugged)= is a
+pure function; the loop only performs the returned action.
+
+| PW reading   | charging_state      | require_plugged | Action             |
+|--------------+---------------------+-----------------+--------------------|
+| >= threshold | Charging / Complete | any             | =DONE= (exit 0)      |
+| >= threshold | Disconnected        | true            | =WAIT_PLUG=          |
+| >= threshold | Disconnected        | false           | =START= (attempt)    |
+| >= threshold | Stopped / NoPower   | any             | =START= (wake first) |
+| >= threshold | unknown / missing   | any             | =WAIT= (log, retry)  |
+| < threshold  | any                 | any             | =SLEEP=              |
+| missing      | any                 | any             | =SLEEP= (log)        |
+
+* Edge cases and error handling
+- =TeslaFleetError= is a =BaseException=; catch it by name, never rely on
+  =except Exception=. Library errors seen in 1.15.0 include =RateLimited=,
+  =VehicleOffline=, =GatewayTimeout=, =ServiceUnavailable=,
+  =InternalServerError=, =OAuthExpired=, =InvalidToken=, =LoginRequired=,
+  =InvalidScope=, =NotFound=, =MobileAccessDisabled=.
+- 429 / transient errors: exponential backoff with jitter (5 s, x2, cap
+  300 s, +/-20%), capped at 5 consecutive failures; reset the counter on
+  success. Inspect =tesla_fleet_api.exceptions= for new subclasses during
+  implementation.
+- Auth faults (401/403): refresh once; if that fails, exit 2 with the
+  =tesla auth login= hint. =InvalidScope= exits 2 and names the missing
+  scope (e.g. =vehicle_cmds= for wake).
+- Expired/revoked refresh token: actionable message to re-run
+  =tesla auth login=.
+- Vehicle asleep or unreachable during wake: timeout, then retry on the
+  next cycle in watch mode; error in =--once= mode.
+- =live_status= 408/timeout (gateway offline): log and keep polling.
+- Never call =charge_start= unless the threshold condition is true; never
+  re-send once charging; =NoPower= / =Disconnected= -> wait, do not spam
+  commands.
+- Lock file: =~/.config/tesla/auto-charge.lock= holds a PID. A live PID ->
+  exit 2; a stale PID (process gone) is replaced; the lock is released on
+  SIGINT/SIGTERM.
+
+* Testing
+- Pure =decide(...)= in =auto_charge.py= unit-tested against the truth
+  table above: below/at/above threshold, plugged, unplugged, already
+  charging, complete, unknown/missing reading, =require_plugged= both ways.
+- =powerwall.py= tests for =percentage_charged=, the ratio fallback, and
+  ZeroDivisionError/missing-key paths.
+- =tokens.py= tests: atomic replace, 0600 enforcement, rotation
+  persistence.
+- =config.py= tests for precedence (flag > env > .env > file), type
+  validation, unknown-key rejection, redaction.
+- Async loop tests with a fake client (no network), =pytest-asyncio=:
+  threshold met, wake timeout, dry-run sends nothing, backoff stops after
+  the cap, SIGINT exits cleanly.
+- =cli.py= smoke tests via Click =CliRunner=: =--version=, =config show/set=,
+  =doctor= exit codes.
+- Lint gate: =ruff check= and =ruff format --check=; tests via
+  =uv run pytest=. CI (M6) runs both on Python 3.13.
+
+* Deployment
+README documents:
+
+- A systemd user unit:
+  =ExecStart=%h/.local/bin/tesla auto-charge --log-file %h/.local/state/tesla/auto-charge.log=
+  with =Restart=on-failure=, =RestartSec=60=, =StartLimitIntervalSec=300=,
+  =StartLimitBurst=3=, plus hardening (=NoNewPrivileges=,
+  =PrivateTmp=, =ProtectSystem=strict=,
+  =ReadWritePaths=%h/.config/tesla=); logs via
+  =journalctl --user -u tesla=.
+- The headless authentication walkthrough.
+- A cron alternative: hourly =tesla auto-charge --once=.
+- The refresh-token rotation caveat: do not run =auth status= while the
+  service is running.
+
+* Milestones
+** TODO M0 --- Tesla developer app (manual, user)
+Create the app at =developer.tesla.com/request= with redirect
+=http://localhost:8085/callback=, origin =https://8cylinder.com=, and the
+scopes above.
+
+/Done when:/ Client ID and Client Secret are stored in =.env=.
+
+/See:/ [[*Tesla developer app (one-time setup)]], [[*Decisions]].
+
+** TODO M1 --- Scaffold
+=uv init= (Python 3.13), dependencies, rename distribution to =tesla-cli=,
+fix the =tesla.cli:main= entry point, CLI skeleton, config + token
+persistence.
+/Done when:/ =uv run tesla --version= prints 0.1.0; =config show= and
+round-trip token load/save tests pass under ruff and pytest.
+
+/See:/ [[*Architecture]], [[*Configuration and tokens]].
+
+** TODO M2 --- Auth
+Headless =auth login= / =auth status=, token refresh + rotation
+persistence, client factory, =products= smoke test and scope
+verification.
+/Done when:/ a real login saves =tokens.json= (0600); =auth status=
+refreshes and rewrites it; =products= lists the configured IDs.
+
+/See:/ [[*Headless OAuth]], [[*Tesla developer app (one-time setup)]].
+
+** TODO M3 --- Key and pairing
+=key generate= (=get_private_key()=), upload the public key to
+=https://8cylinder.com/.well-known/appspecific/com.tesla.3p.public-key.pem=,
+=key register= (=partner.register("8cylinder.com")=), pair the vehicle via
+=https://tesla.com/_ak/8cylinder.com=, and =key status= (=fleet_status()=).
+Keep the public key file hosted for the life of the app.
+/Done when:/ =key status= reports the vehicle accepts the partner key and
+the hosted URL serves the exact public PEM.
+
+/See:/ [[*Tesla developer app (one-time setup)]], [[*Decisions]].
+
+** TODO M4 --- Read-only commands
+=products=, =powerwall status=, =car status=.
+/Done when:/ each prints the fields in the CLI table; missing IDs exit 2
+with a clear message; powerwall ratio fallback covered by tests.
+
+/See:/ [[*CLI surface (v0.1)]], [[*Configuration and tokens]].
+
+** TODO M5 --- Watch loop
+=auto-charge= with =--dry-run=, =--once=, lock file, signals and backoff;
+unit-tested =decide()=.
+/Done when:/ fake-client tests cover the decide truth table; a dry run
+against the live API logs the correct decision without sending commands.
+
+/See:/ [[*Core flow: auto-charge]], [[*decide() truth table]], [[*Edge cases and error handling]].
+
+** TODO M6 --- Charging commands and polish
+Wake/plug handling and =charge_start= / =charge_stop= / =set_charge_limit=
+over the signed transport, =doctor=, CI, tests, README and systemd docs.
+/Done when:/ a real threshold crossing wakes the car, starts charging, and
+verifies =Charging= with a second read; commands are never resent;
+=doctor= reports config/auth/connectivity; CI is green.
+
+/See:/ [[*CLI surface (v0.1)]], [[*Deployment]], [[*Testing]], [[*Risks and open items]].
+
+* Backlog (post-v0.1)
+- Telemetry streaming (=fleet_telemetry_config=) instead of polling.
+- Local control: BLE for the car, =aiopowerwall=/TEDAPI for the gateway.
+- Multiple vehicles/sites with per-entity config.
+- Notifications (ntfy, Home Assistant, email) on trigger/failure.
+- Hysteresis: stop charging when the Powerwall drops below a floor.
+- =--json= output on status commands for scripting.
+- Tariff-aware windows using =get_tariff_periods()=.
+- Historical energy/charge queries and a small web UI.
+
+* Risks and open items
+- *Python floor follows the library.* We always run the latest
+  =tesla-fleet-api= (>= 3.13 required today); =uv= pins the interpreter
+  per project, so the host's system Python is irrelevant. When the
+  library raises its floor, bump =.python-version= and =requires-python=
+  and relock.
+- *Signed commands require a publicly hosted key.* Tesla requires
+  =https://8cylinder.com/.well-known/appspecific/com.tesla.3p.public-key.pem=
+  before a vehicle pairs the virtual key. =8cylinder.com= is available, so
+  =signed= is the default and M3 sets it up; =fleet= remains a fallback
+  for older vehicles or if pairing fails. =vehicle.fleet_status([vin])=
+  reports whether the car accepts the partner key.
+- *Documentation drift.* The library README/docs show =handshake()= while
+  1.15.0 exposes =handshakeVehicleSecurity()= and =handshakeInfotainment()=;
+  re-check the installed version before M3/M6.
+- *Unsigned command longevity.* Tesla is steering integrations toward
+  signed commands / Fleet Telemetry; =fleet= mode may be deprecated
+  eventually. Keep the transport toggle thin so a switch is cheap.
+- *Scope uncertainty.* =wake_up= is believed to need =vehicle_cmds= and
+  =products= may need =user_data=; confirm on first live run and update
+  the scopes list.
+- Confirm =percentage_charged= is present in your site's =live_status=
+  during implementation; the energy-ratio fallback covers it if not.
+- *Refresh-token rotation races* between the service and manual commands;
+  mitigated by the lock file and the "no concurrent =auth status=" rule.
+- Distribution name =tesla-cli= vs =tesla= (PyPI collision) is
+  irrelevant unless the package is published.
+- Charging commands are not idempotent; the loop starts charging at most
+  once and exits.
