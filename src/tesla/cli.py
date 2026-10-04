@@ -8,12 +8,14 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
+import aiohttp
 import click
 from rich.console import Console
 from rich.table import Table
 from tesla_fleet_api.exceptions import (
     InvalidScope,
     InvalidToken,
+    LibraryError,
     LoginRequired,
     OAuthExpired,
     TeslaFleetError,
@@ -21,14 +23,22 @@ from tesla_fleet_api.exceptions import (
 
 from . import __version__
 from .client import (
+    HOSTED_KEY_PATH,
     SCOPES,
     AuthError,
     Credentials,
     ensure_fresh_token,
     exchange_code,
+    fetch_hosted_key,
+    generate_key,
+    key_point,
     load_credentials,
+    load_public_key,
     oauth_client,
     parse_callback,
+    public_point,
+    register_domain,
+    registered_public_key,
 )
 from .config import ConfigError, dump_toml, load_config, save_config, set_dotted
 from .logging import setup_logging
@@ -56,6 +66,10 @@ def _api_errors():
         _fail(f"missing scope: {exc}; re-run 'tesla auth login' to grant it")
     except _AUTH_FAULTS as exc:
         _fail(f"authentication failed: {exc}; re-run 'tesla auth login'")
+    except LibraryError as exc:
+        _fail(f"library error: {exc}", 3)
+    except aiohttp.ClientError as exc:
+        _fail(f"network error: {exc}", 3)
     except TeslaFleetError as exc:
         _fail(f"Tesla API error: {exc}", 3)
 
@@ -253,6 +267,121 @@ def products() -> None:
 
         data = asyncio.run(run())
     _render_products(data)
+
+
+def _match_status(local_point: str, other: str | None) -> str:
+    point = key_point(other)
+    if point is None:
+        return "[red]missing or unreadable[/red]"
+    if point == local_point:
+        return "[green]matches local key[/green]"
+    return "[red]does not match local key[/red]"
+
+
+@cli.group()
+def key() -> None:
+    """Manage the EC key for partner registration and signed commands."""
+
+
+@key.command("generate")
+@click.option("--pem-only", is_flag=True, help="Print only the public PEM.")
+def key_generate(pem_only: bool) -> None:
+    """Create the EC P-256 private key and print the public PEM."""
+    with _api_errors():
+        config = load_config()
+        path, public_pem = asyncio.run(generate_key(config))
+    if pem_only:
+        click.echo(public_pem, nl=False)
+        return
+    console.print(f"Private key written to [bold]{path}[/bold] (mode 0600).")
+    console.print("Host this public key at (exactly, permanently):")
+    target = config.domain or "YOUR_DOMAIN"
+    console.print(f"  [bold]https://{target}{HOSTED_KEY_PATH}[/bold]")
+    click.echo(public_pem, nl=False)
+
+
+@key.command("register")
+@click.option(
+    "--domain", default=None, help="App root domain (default: config domain)."
+)
+def key_register(domain: str | None) -> None:
+    """Register the partner domain with Tesla; host the key first."""
+    with _api_errors():
+        config = load_config()
+        domain = domain or config.domain
+        if not domain:
+            _fail(
+                "no domain set; run 'tesla config set domain <domain>' or pass --domain"
+            )
+        credentials = load_credentials()
+
+        async def run() -> dict:
+            async with oauth_client(credentials=credentials, config=config) as oauth:
+                return await register_domain(oauth, credentials, domain)
+
+        result = asyncio.run(run())
+    console.print(f"[green]Registered[/green] {domain} with Tesla.")
+    response = result.get("response")
+    if response:
+        console.print(str(response))
+
+
+@key.command("status")
+def key_status() -> None:
+    """Compare local, Tesla-registered, and hosted public keys."""
+    with _api_errors():
+        config = load_config()
+        domain = config.domain
+        if not domain:
+            _fail("no domain set; run 'tesla config set domain <domain>'")
+        credentials = load_credentials()
+        _, local_pem = asyncio.run(load_public_key(config))
+        local_point = public_point(local_pem)
+        if local_point is None:
+            _fail("could not read the local public key")
+
+        async def run() -> tuple[str | None, str | None]:
+            async with oauth_client(credentials=credentials, config=config) as oauth:
+                registered = await registered_public_key(oauth, credentials, domain)
+            hosted = await fetch_hosted_key(domain)
+            return registered, hosted
+
+        registered, hosted = asyncio.run(run())
+        vin = config.vehicle.vin
+        stored = load_tokens()
+        fleet_result: dict | None = None
+        if vin and stored is not None:
+
+            async def run_fleet() -> dict:
+                async with oauth_client(
+                    credentials=credentials, config=config, stored=stored
+                ) as oauth:
+                    await ensure_fresh_token(oauth)
+                    vehicle = oauth.vehicles.createFleet(vin)
+                    return await vehicle.fleet_status([vin])
+
+            try:
+                fleet_result = asyncio.run(run_fleet())
+            except TeslaFleetError as exc:
+                fleet_result = {"error": str(exc)}
+
+    table = Table(title=f"Key status for {domain}")
+    table.add_column("Source")
+    table.add_column("Status")
+    table.add_row("local private key", "[green]present[/green]")
+    table.add_row("Tesla registered", _match_status(local_point, registered))
+    table.add_row("hosted URL", _match_status(local_point, hosted))
+    console.print(table)
+    if fleet_result is not None:
+        console.print(
+            f"Vehicle fleet status: {fleet_result.get('response', fleet_result)}"
+        )
+    elif vin:
+        console.print(
+            "Vehicle fleet status: skipped (no user tokens; run 'tesla auth login')"
+        )
+    else:
+        console.print("Vehicle fleet status: skipped (no VIN configured)")
 
 
 @cli.group()

@@ -1,12 +1,24 @@
+import stat
+import time
+
 import pytest
 
 from tesla.client import (
     AuthError,
     Credentials,
     ensure_fresh_token,
+    extract_public_key,
+    generate_key,
+    key_point,
     load_credentials,
+    load_public_key,
+    normalize_pem,
     parse_callback,
+    public_point,
+    register_domain,
+    registered_public_key,
 )
+from tesla.config import load_config
 from tesla.tokens import Tokens, load_tokens
 
 
@@ -111,3 +123,94 @@ async def test_ensure_fresh_token_valid_returns_none(config_dir):
 async def test_ensure_fresh_token_value_error(config_dir):
     with pytest.raises(AuthError, match="tesla auth login"):
         await ensure_fresh_token(FakeOAuth(error=ValueError("invalid_grant")))
+
+
+async def test_generate_key_creates_0600(config_dir):
+    config = load_config()
+    path, public_pem = await generate_key(config)
+    assert path == config_dir / "private_key.pem"
+    assert public_pem.startswith("-----BEGIN PUBLIC KEY-----")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+async def test_generate_key_is_idempotent(config_dir):
+    config = load_config()
+    _, first = await generate_key(config)
+    _, second = await load_public_key(config)
+    assert normalize_pem(first) == normalize_pem(second)
+
+
+async def test_load_public_key_missing(config_dir):
+    with pytest.raises(AuthError, match="key generate"):
+        await load_public_key(load_config())
+
+
+def test_extract_public_key_shapes():
+    pem = "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----"
+    assert extract_public_key({"response": {"public_key": pem}}) == pem
+    assert extract_public_key({"response": pem}) == pem
+    assert extract_public_key({"response": {"other": 1}}) is None
+    assert extract_public_key({}) is None
+
+
+def test_normalize_pem():
+    messy = "  -----BEGIN PUBLIC KEY-----\n\nabc\n-----END PUBLIC KEY-----  \n"
+    clean = "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----"
+    assert normalize_pem(messy) == clean
+    assert normalize_pem(None) is None
+
+
+async def test_key_point_pem_and_hex(config_dir):
+    _, pem = await generate_key(load_config())
+    point = key_point(pem)
+    assert point is not None
+    assert point.startswith("04")
+    assert len(point) == 130
+    assert public_point(pem) == point
+    assert key_point(point) == point
+    assert key_point(None) is None
+    assert key_point("not-a-key") == "not-a-key"
+
+
+class FakePartner:
+    def __init__(self):
+        self.domain = None
+        self.public_key_result = None
+
+    async def register(self, domain):
+        self.domain = domain
+        return {"response": {"domain": domain}}
+
+    async def public_key(self, domain):
+        return self.public_key_result
+
+
+class FakePartnerOAuth:
+    def __init__(self, public_key_result=None):
+        self.partner = FakePartner()
+        self.partner.public_key_result = public_key_result
+        self.expires = 0
+        self.logged_in = None
+
+    async def partner_login(self, client_id, client_secret, scopes=None):
+        self.logged_in = (client_id, client_secret, scopes)
+        return {"access_token": "tok", "expires_in": 3600}
+
+
+async def test_register_domain_sets_expires(config_dir):
+    oauth = FakePartnerOAuth()
+    result = await register_domain(oauth, Credentials("id", "secret"), "example.com")
+    assert oauth.logged_in[0:2] == ("id", "secret")
+    assert oauth.logged_in[2] is not None
+    assert oauth.partner.domain == "example.com"
+    assert oauth.expires > time.time()
+    assert result["response"]["domain"] == "example.com"
+
+
+async def test_registered_public_key(config_dir):
+    pem = "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----"
+    oauth = FakePartnerOAuth(public_key_result={"response": {"public_key": pem}})
+    assert (
+        await registered_public_key(oauth, Credentials("id", "secret"), "example.com")
+        == pem
+    )
