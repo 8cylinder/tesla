@@ -4,6 +4,7 @@ from click.testing import CliRunner
 
 from tesla import __version__
 from tesla.cli import cli
+from tesla.tokens import Tokens, load_tokens, save_tokens
 
 
 def invoke(config_dir, *args, env=None):
@@ -47,6 +48,19 @@ def test_config_set_unknown_key_exits_2(config_dir):
 def test_config_set_invalid_value_exits_2(config_dir):
     result = invoke(config_dir, "config", "set", "auto_charge.threshold", "150")
     assert result.exit_code == 2
+
+
+def test_auth_logout_no_token(config_dir):
+    result = invoke(config_dir, "auth", "logout")
+    assert result.exit_code == 0
+    assert "nothing to do" in result.output
+
+
+def test_auth_logout_removes_token(config_dir):
+    save_tokens(Tokens("refresh", 1))
+    result = invoke(config_dir, "auth", "logout")
+    assert result.exit_code == 0
+    assert load_tokens() is None
 
 
 def test_auth_status_without_tokens_exits_2(config_dir):
@@ -168,3 +182,26 @@ def test_auto_charge_without_tokens_exits_2(config_dir):
     result = invoke(config_dir, "auto-charge", "--once")
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
+
+
+def test_car_charge_limit_out_of_range_exits_2(config_dir):
+    result = invoke(config_dir, "car", "charge", "limit", "150")
+    assert result.exit_code == 2
+
+
+def test_car_charge_start_without_tokens_exits_2(config_dir):
+    assert invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code == 0
+    result = invoke(config_dir, "car", "charge", "start")
+    assert result.exit_code == 2
+    assert "tesla auth login" in combined(result)
+
+
+def test_doctor_missing_credentials_exits_2(config_dir, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for name in ("TESLA_CLIENT_ID", "TESLA_CLIENT_SECRET", "TESLA_REDIRECT_URI"):
+        monkeypatch.delenv(name, raising=False)
+    result = invoke(config_dir, "doctor")
+    assert result.exit_code == 2
+    output = combined(result)
+    assert "credentials" in output
+    assert "tokens" in output

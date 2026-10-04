@@ -18,7 +18,7 @@ from tesla_fleet_api import TeslaFleetOAuth
 from tesla_fleet_api.const import Scope
 from tesla_fleet_api.exceptions import TeslaFleetError
 
-from .config import Config, config_dir, key_path, load_config
+from .config import Config, ConfigError, config_dir, key_path, load_config
 from .tokens import Tokens, save_tokens
 
 DEFAULT_REDIRECT_URI = "http://localhost:8085/callback"
@@ -144,6 +144,17 @@ async def oauth_client(
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         yield build_oauth(session, credentials, config, stored)
+
+
+async def build_vehicle(oauth: TeslaFleetOAuth, config: Config):
+    """Create the vehicle bound to the configured command transport."""
+    vin = config.vehicle.vin
+    if vin is None:
+        raise ConfigError("no VIN set; run 'tesla config set vehicle.vin <vin>'")
+    if config.vehicle.command_mode == "signed":
+        await oauth.get_private_key(str(key_path(config)))
+        return oauth.vehicles.createSigned(vin)
+    return oauth.vehicles.createFleet(vin)
 
 
 async def ensure_fresh_token(

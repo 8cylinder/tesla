@@ -35,6 +35,7 @@ from .client import (
     SCOPES,
     AuthError,
     Credentials,
+    build_vehicle,
     ensure_fresh_token,
     exchange_code,
     fetch_hosted_key,
@@ -49,12 +50,15 @@ from .client import (
     registered_public_key,
 )
 from .config import (
+    Config,
     ConfigError,
     dump_toml,
+    key_path,
     load_config,
     lock_path,
     save_config,
     set_dotted,
+    tokens_path,
 )
 from .logging import setup_logging
 from .powerwall import backup_reserve, grid_status, percentage_charged
@@ -265,6 +269,19 @@ def auth_status() -> None:
     console.print(f"Expires {_format_expiry(expires)}")
 
 
+@auth.command("logout")
+def auth_logout() -> None:
+    """Delete the stored refresh token (it is not revoked with Tesla)."""
+    path = tokens_path()
+    if not path.exists():
+        console.print("No stored token; nothing to do.")
+        return
+    path.unlink()
+    console.print(
+        f"[green]Removed[/green] {path}. Run 'tesla auth login' to authorize again."
+    )
+
+
 @cli.command()
 def products() -> None:
     """List vehicles and energy sites on the account."""
@@ -399,6 +416,171 @@ def car_status() -> None:
 
         data = asyncio.run(run())
     _render_car(data)
+
+
+def _car_context() -> tuple[Config, Credentials, Tokens]:
+    config = load_config()
+    if config.vehicle.vin is None:
+        _fail("no VIN set; run 'tesla config set vehicle.vin <vin>'")
+    credentials = load_credentials()
+    stored = load_tokens()
+    if stored is None:
+        _fail("not logged in; run 'tesla auth login'")
+    return config, credentials, stored
+
+
+async def _car_action(config, credentials, stored, action):
+    """Wake the vehicle, run one command on it, and return the response."""
+    async with oauth_client(
+        credentials=credentials, config=config, stored=stored
+    ) as oauth:
+        await ensure_fresh_token(oauth)
+        vehicle = await build_vehicle(oauth, config)
+        await vehicle.wake_up(
+            wait=True, timeout=config.auto_charge.wake_timeout_seconds
+        )
+        return await action(vehicle)
+
+
+@car.group("charge")
+def car_charge() -> None:
+    """Send manual charging commands (wakes the vehicle first)."""
+
+
+@car_charge.command("start")
+def car_charge_start() -> None:
+    """Start charging now."""
+    with _api_errors():
+        config, credentials, stored = _car_context()
+        result = asyncio.run(
+            _car_action(config, credentials, stored, lambda v: v.charge_start())
+        )
+    console.print("[green]charge_start sent[/green]")
+    if result:
+        console.print(str(result))
+
+
+@car_charge.command("stop")
+def car_charge_stop() -> None:
+    """Stop charging now."""
+    with _api_errors():
+        config, credentials, stored = _car_context()
+        result = asyncio.run(
+            _car_action(config, credentials, stored, lambda v: v.charge_stop())
+        )
+    console.print("[green]charge_stop sent[/green]")
+    if result:
+        console.print(str(result))
+
+
+@car_charge.command("limit")
+@click.argument("percent", type=click.IntRange(0, 100))
+def car_charge_limit(percent: int) -> None:
+    """Set the charge limit to PERCENT (0-100)."""
+    with _api_errors():
+        config, credentials, stored = _car_context()
+        result = asyncio.run(
+            _car_action(
+                config, credentials, stored, lambda v: v.set_charge_limit(percent)
+            )
+        )
+    console.print(f"[green]set_charge_limit {percent}% sent[/green]")
+    if result:
+        console.print(str(result))
+
+
+@cli.command()
+def doctor() -> None:
+    """Check config, credentials, auth, connectivity, IDs, and keys."""
+    rows: list[tuple[str, bool, str]] = []
+    config: Config | None = None
+    credentials: Credentials | None = None
+    stored: Tokens | None = None
+
+    try:
+        config = load_config()
+        rows.append(("config", True, f"region={config.region}"))
+    except ConfigError as exc:
+        rows.append(("config", False, str(exc)))
+
+    try:
+        credentials = load_credentials()
+        rows.append(("credentials", True, "client id and secret found"))
+    except AuthError as exc:
+        rows.append(("credentials", False, str(exc)))
+
+    try:
+        stored = load_tokens()
+        if stored is None:
+            rows.append(("tokens", False, "not logged in; run 'tesla auth login'"))
+        else:
+            rows.append(("tokens", True, "refresh token present"))
+    except TokenError as exc:
+        rows.append(("tokens", False, str(exc)))
+
+    if config is not None:
+        vin = config.vehicle.vin
+        site_id = config.powerwall.energy_site_id
+        rows.append(("vehicle.vin", vin is not None, vin or "not set"))
+        rows.append(
+            (
+                "powerwall.energy_site_id",
+                site_id is not None,
+                str(site_id) if site_id is not None else "not set",
+            )
+        )
+        if config.vehicle.command_mode == "signed":
+            path = key_path(config)
+            rows.append(("private key", path.exists(), str(path)))
+
+    api_failed = False
+    if config is not None and credentials is not None and stored is not None:
+
+        async def fetch_products():
+            async with oauth_client(
+                credentials=credentials, config=config, stored=stored
+            ) as oauth:
+                await ensure_fresh_token(oauth)
+                return await oauth.products()
+
+        try:
+            data = asyncio.run(fetch_products())
+        except (AuthError, LibraryError, TeslaFleetError, aiohttp.ClientError) as exc:
+            api_failed = True
+            rows.append(("api", False, str(exc)))
+        else:
+            items = [i for i in (data.get("response") or []) if isinstance(i, dict)]
+            vins = {i.get("vin") for i in items}
+            sites = {i.get("energy_site_id") for i in items}
+            rows.append(("api", True, f"{len(vins)} vehicles, {len(sites)} sites"))
+            if config.vehicle.vin:
+                rows.append(
+                    (
+                        "vin listed",
+                        config.vehicle.vin in vins,
+                        config.vehicle.vin,
+                    )
+                )
+            if config.powerwall.energy_site_id:
+                rows.append(
+                    (
+                        "site id listed",
+                        config.powerwall.energy_site_id in sites,
+                        str(config.powerwall.energy_site_id),
+                    )
+                )
+
+    table = Table(title="tesla doctor")
+    table.add_column("Check")
+    table.add_column("Status")
+    table.add_column("Detail")
+    failed = False
+    for name, ok, detail in rows:
+        failed = failed or not ok
+        table.add_row(name, "[green]ok[/green]" if ok else "[red]fail[/red]", detail)
+    console.print(table)
+    if failed:
+        raise SystemExit(3 if api_failed else 2)
 
 
 @cli.command("auto-charge")
