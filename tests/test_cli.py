@@ -1,3 +1,5 @@
+import stat
+
 from click.testing import CliRunner
 
 from tesla import __version__
@@ -66,3 +68,51 @@ def test_auth_login_missing_credentials_exits_2(config_dir, tmp_path, monkeypatc
     result = invoke(config_dir, "auth", "login")
     assert result.exit_code == 2
     assert "TESLA_CLIENT_ID" in combined(result)
+
+
+def test_key_generate_creates_private_key(config_dir):
+    result = invoke(config_dir, "key", "generate")
+    assert result.exit_code == 0
+    assert "BEGIN PUBLIC KEY" in result.output
+    path = config_dir / "private_key.pem"
+    assert path.exists()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_key_generate_pem_only(config_dir):
+    result = invoke(config_dir, "key", "generate", "--pem-only")
+    assert result.exit_code == 0
+    assert result.output.startswith("-----BEGIN PUBLIC KEY-----")
+
+
+def test_key_register_without_domain_exits_2(config_dir):
+    result = invoke(config_dir, "key", "register")
+    assert result.exit_code == 2
+    assert "no domain" in combined(result)
+
+
+def test_key_register_without_credentials_exits_2(config_dir, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for name in ("TESLA_CLIENT_ID", "TESLA_CLIENT_SECRET", "TESLA_REDIRECT_URI"):
+        monkeypatch.delenv(name, raising=False)
+    result = invoke(config_dir, "key", "register", "--domain", "example.com")
+    assert result.exit_code == 2
+    assert "TESLA_CLIENT_ID" in combined(result)
+
+
+def test_key_status_without_key_exits_2(config_dir, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = invoke(config_dir, "config", "set", "domain", "example.com")
+    assert result.exit_code == 0
+    result = invoke(
+        config_dir,
+        "key",
+        "status",
+        env={
+            "TESLA_CLIENT_ID": "id",
+            "TESLA_CLIENT_SECRET": "secret",
+            "TESLA_REDIRECT_URI": "http://localhost:8085/callback",
+        },
+    )
+    assert result.exit_code == 2
+    assert "key generate" in combined(result)

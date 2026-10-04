@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -10,16 +11,22 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from dotenv import dotenv_values
 from tesla_fleet_api import TeslaFleetOAuth
 from tesla_fleet_api.const import Scope
 from tesla_fleet_api.exceptions import TeslaFleetError
 
-from .config import Config, config_dir, load_config
+from .config import Config, config_dir, key_path, load_config
 from .tokens import Tokens, save_tokens
 
 DEFAULT_REDIRECT_URI = "http://localhost:8085/callback"
+HOSTED_KEY_PATH = "/.well-known/appspecific/com.tesla.3p.public-key.pem"
 TIMEOUT_SECONDS = 30
+# partner_accounts/public_key requires vehicle_device_data on the partner
+# token; openid alone is enough for register but returns 403 for the lookup.
+PARTNER_SCOPES = [Scope.OPENID, Scope.VEHICLE_DEVICE_DATA]
 SCOPES = [
     Scope.OPENID,
     Scope.OFFLINE_ACCESS,
@@ -202,3 +209,116 @@ def parse_callback(raw: str, expected_state: str | None = "login") -> str:
     if not code:
         raise AuthError("callback URL did not contain a code")
     return code
+
+
+async def _public_key(config: Config) -> tuple[Path, str]:
+    """Load or create the EC P-256 key and return (path, public PEM)."""
+    path = key_path(config)
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        client = TeslaFleetOAuth(session, region=config.region, client_id="")
+        await client.get_private_key(str(path))
+        return path, client.public_pem
+
+
+async def generate_key(config: Config) -> tuple[Path, str]:
+    """Create the private key when absent; return its path and public PEM."""
+    path = key_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return await _public_key(config)
+
+
+async def load_public_key(config: Config) -> tuple[Path, str]:
+    """Load an existing private key and return its path and public PEM."""
+    path = key_path(config)
+    if not path.exists():
+        raise AuthError(f"no private key at {path}; run 'tesla key generate'")
+    return await _public_key(config)
+
+
+async def _partner_token(oauth: TeslaFleetOAuth, credentials: Credentials) -> None:
+    """Authenticate as the partner app (client credentials grant).
+
+    partner_login() sets the access token but not expires, so set expires to
+    keep the next call from treating the partner token as expired and trying
+    a user-token refresh (which would clobber it).
+    """
+    token = await oauth.partner_login(
+        credentials.client_id, credentials.client_secret, PARTNER_SCOPES
+    )
+    oauth.expires = int(time.time()) + int(token.get("expires_in", 3600))
+
+
+async def register_domain(
+    oauth: TeslaFleetOAuth, credentials: Credentials, domain: str
+) -> dict:
+    """Register the partner domain with Tesla using a partner token."""
+    await _partner_token(oauth, credentials)
+    return await oauth.partner.register(domain)
+
+
+def extract_public_key(data: dict) -> str | None:
+    """Pull the PEM out of a partner_accounts/public_key response."""
+    response = data.get("response", data)
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        for key in ("public_key", "key", "pem"):
+            value = response.get(key)
+            if isinstance(value, str):
+                return value
+    return None
+
+
+async def registered_public_key(
+    oauth: TeslaFleetOAuth, credentials: Credentials, domain: str
+) -> str | None:
+    """Return Tesla's registered public key for the domain, if any."""
+    await _partner_token(oauth, credentials)
+    data = await oauth.partner.public_key(domain)
+    return extract_public_key(data)
+
+
+async def fetch_hosted_key(domain: str) -> str | None:
+    """Fetch the public PEM served from the domain's well-known path."""
+    url = f"https://{domain}{HOSTED_KEY_PATH}"
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
+    async with (
+        aiohttp.ClientSession(timeout=timeout) as session,
+        session.get(url) as resp,
+    ):
+        if resp.status == 404:
+            return None
+        resp.raise_for_status()
+        return await resp.text()
+
+
+def normalize_pem(pem: str | None) -> str | None:
+    """Normalize a PEM for comparison (drop empty lines and spaces)."""
+    if pem is None:
+        return None
+    lines = [line.strip() for line in pem.strip().splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def public_point(pem: str) -> str | None:
+    """Return the uncompressed EC point hex for a PEM public key."""
+    try:
+        key = serialization.load_pem_public_key(pem.encode())
+    except ValueError:
+        return None
+    if not isinstance(key, ec.EllipticCurvePublicKey):
+        return None
+    return key.public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+    ).hex()
+
+
+def key_point(value: str | None) -> str | None:
+    """Normalize a PEM or already-hex public key to an uncompressed point."""
+    if value is None:
+        return None
+    text = value.strip()
+    if text.startswith("-----"):
+        return public_point(text)
+    return text.lower()
