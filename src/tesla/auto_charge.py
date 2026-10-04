@@ -25,8 +25,8 @@ from tesla_fleet_api.exceptions import (
 )
 
 from .car import charging_state as read_charging_state
-from .client import ensure_fresh_token
-from .config import Config, ConfigError, key_path
+from .client import build_vehicle, ensure_fresh_token
+from .config import Config, ConfigError
 from .powerwall import percentage_charged
 
 LOGGER = logging.getLogger(__name__)
@@ -125,14 +125,7 @@ class TeslaAutoChargeClient:
     async def build(self) -> None:
         await ensure_fresh_token(self._oauth)
         config = self._config
-        vin = config.vehicle.vin
-        if vin is None:
-            raise ConfigError("no VIN set; run 'tesla config set vehicle.vin <vin>'")
-        if config.vehicle.command_mode == "signed":
-            await self._oauth.get_private_key(str(key_path(config)))
-            self._vehicle = self._oauth.vehicles.createSigned(vin)
-        else:
-            self._vehicle = self._oauth.vehicles.createFleet(vin)
+        self._vehicle = await build_vehicle(self._oauth, config)
         site_id = config.powerwall.energy_site_id
         if site_id is None:
             raise ConfigError(
