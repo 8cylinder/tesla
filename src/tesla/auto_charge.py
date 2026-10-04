@@ -36,6 +36,12 @@ BACKOFF_CAP = 300.0
 MAX_FAILURES = 5
 AUTH_ERRORS = (OAuthExpired, InvalidToken, LoginRequired, InvalidScope)
 
+NOTIFY_STARTED_COOLDOWN = 12 * 3600
+NOTIFY_THRESHOLD_COOLDOWN = 6 * 3600
+NOTIFY_WAIT_PLUG_COOLDOWN = 2 * 3600
+NOTIFY_ALREADY_CHARGING_COOLDOWN = 24 * 3600
+NOTIFY_POLL_FAILED_COOLDOWN = 3600
+
 
 class Action(Enum):
     DONE = "done"
@@ -193,6 +199,7 @@ class AutoCharger:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         jitter: Callable[[float, float], float] = random.uniform,
+        notifier=None,
     ) -> None:
         self.client = client
         self.auto = config.auto_charge
@@ -201,10 +208,37 @@ class AutoCharger:
         self.sleep = sleep
         self.clock = clock
         self.jitter = jitter
+        self.notifier = notifier
         self.failures = 0
         self.started_at = clock()
 
+    async def _notify(
+        self,
+        stage: str,
+        message: str,
+        *,
+        priority: int | None = None,
+        tags: tuple[str, ...] | list[str] = (),
+        cooldown: float | None = None,
+    ) -> None:
+        """Best-effort notification; never affects the loop."""
+        if self.notifier is None or self.dry_run:
+            return
+        await self.notifier.send(
+            stage, message, priority=priority, tags=tags, cooldown=cooldown
+        )
+
+    def _reset_notifications(self, *stages: str) -> None:
+        if self.notifier is not None and hasattr(self.notifier, "reset"):
+            self.notifier.reset(*stages)
+
     async def run(self) -> int:
+        await self._notify(
+            "started",
+            "auto-charge watch started",
+            priority=2,
+            cooldown=NOTIFY_STARTED_COOLDOWN,
+        )
         while True:
             if self.auto.max_runtime_hours:
                 elapsed = self.clock() - self.started_at
@@ -213,6 +247,12 @@ class AutoCharger:
                         "max runtime of %s h reached before a trigger",
                         self.auto.max_runtime_hours,
                     )
+                    await self._notify(
+                        "max_runtime",
+                        "max runtime reached before a trigger",
+                        priority=4,
+                        tags=("warning",),
+                    )
                     return 3
             try:
                 await self.client.refresh()
@@ -220,6 +260,12 @@ class AutoCharger:
             except AUTH_ERRORS as exc:
                 LOGGER.error(
                     "authentication failed: %s; re-run 'tesla auth login'", exc
+                )
+                await self._notify(
+                    "auth_failed",
+                    f"authentication failed: {exc}; re-run 'tesla auth login'",
+                    priority=5,
+                    tags=("rotating_light",),
                 )
                 return 2
             except (TeslaFleetError, aiohttp.ClientError) as exc:
@@ -236,6 +282,12 @@ class AutoCharger:
                     LOGGER.error(
                         "authentication failed: %s; re-run 'tesla auth login'", exc
                     )
+                    await self._notify(
+                        "auth_failed",
+                        f"authentication failed: {exc}; re-run 'tesla auth login'",
+                        priority=5,
+                        tags=("rotating_light",),
+                    )
                     return 2
                 except VehicleOffline:
                     state = "Asleep"
@@ -246,6 +298,15 @@ class AutoCharger:
                     continue
                 action = decide(
                     pct, self.auto.threshold, state, self.auto.require_plugged
+                )
+
+            if pct is not None and pct >= self.auto.threshold:
+                await self._notify(
+                    "threshold",
+                    f"Powerwall at {pct:.1f}% (threshold {self.auto.threshold}%)",
+                    priority=4,
+                    tags=("battery",),
+                    cooldown=NOTIFY_THRESHOLD_COOLDOWN,
                 )
 
             self.failures = 0
@@ -260,15 +321,44 @@ class AutoCharger:
                         "for plug (require_plugged)",
                         pct,
                     )
+                    await self._notify(
+                        "wait_plug",
+                        "Powerwall at threshold; vehicle asleep, waiting for "
+                        "plug (require_plugged)",
+                        priority=3,
+                        tags=("electric_plug",),
+                        cooldown=NOTIFY_WAIT_PLUG_COOLDOWN,
+                    )
                 else:
                     LOGGER.info(
                         "Powerwall %s is at threshold but charge state is unknown",
                         pct,
                     )
+                    await self._notify(
+                        "wait_plug",
+                        "Powerwall at threshold; charge state unknown, waiting",
+                        priority=3,
+                        tags=("warning",),
+                        cooldown=NOTIFY_WAIT_PLUG_COOLDOWN,
+                    )
             elif action is Action.WAIT_PLUG:
                 LOGGER.info("Powerwall %s is at threshold; waiting for plug", pct)
+                await self._notify(
+                    "wait_plug",
+                    "Powerwall at threshold; waiting for the car to be plugged in",
+                    priority=3,
+                    tags=("electric_plug",),
+                    cooldown=NOTIFY_WAIT_PLUG_COOLDOWN,
+                )
             elif action is Action.DONE:
                 LOGGER.info("already charging or complete; nothing to do")
+                await self._notify(
+                    "already_charging",
+                    "vehicle already charging or complete; nothing to do",
+                    priority=2,
+                    tags=("heavy_check_mark",),
+                    cooldown=NOTIFY_ALREADY_CHARGING_COOLDOWN,
+                )
                 return 0
             else:
                 try:
@@ -276,6 +366,15 @@ class AutoCharger:
                 except _ExitCode as exc:
                     return exc.code
                 if result is TriggerResult.STARTED:
+                    await self._notify(
+                        "charging",
+                        "charging started",
+                        priority=4,
+                        tags=("zap", "heavy_check_mark"),
+                    )
+                    self._reset_notifications(
+                        "threshold", "wait_plug", "already_charging"
+                    )
                     return 0
                 if result is TriggerResult.WAIT:
                     if self.once:
@@ -288,6 +387,12 @@ class AutoCharger:
                         "giving up after %s consecutive trigger failures",
                         self.failures,
                     )
+                    await self._notify(
+                        "gave_up",
+                        f"giving up after {self.failures} consecutive trigger failures",
+                        priority=5,
+                        tags=("rotating_light",),
+                    )
                     return 3
                 await self.sleep(backoff_delay(self.failures, self.jitter))
                 continue
@@ -299,13 +404,33 @@ class AutoCharger:
     async def _backoff(self, exc: BaseException) -> int | None:
         if self.once:
             LOGGER.error("poll failed: %s", exc)
+            await self._notify(
+                "poll_failed",
+                f"poll failed: {exc}",
+                priority=3,
+                tags=("warning",),
+            )
             return 3
         self.failures += 1
         if self.failures >= MAX_FAILURES:
             LOGGER.error(
                 "giving up after %s consecutive failures: %s", self.failures, exc
             )
+            await self._notify(
+                "gave_up",
+                f"giving up after {self.failures} consecutive failures: {exc}",
+                priority=5,
+                tags=("rotating_light",),
+            )
             return 3
+        if self.failures == 1:
+            await self._notify(
+                "poll_failed",
+                f"poll failed: {exc}",
+                priority=3,
+                tags=("warning",),
+                cooldown=NOTIFY_POLL_FAILED_COOLDOWN,
+            )
         delay = backoff_delay(self.failures, self.jitter)
         LOGGER.warning(
             "poll failed (%s/%s): %s; retrying in %.0f s",
@@ -331,23 +456,54 @@ class AutoCharger:
                 state = await self.client.charging_state()
                 if state == "Disconnected":
                     LOGGER.info("vehicle is awake but not plugged in; waiting for plug")
+                    await self._notify(
+                        "wait_plug",
+                        "vehicle is awake but not plugged in; waiting for plug",
+                        priority=3,
+                        tags=("electric_plug",),
+                        cooldown=NOTIFY_WAIT_PLUG_COOLDOWN,
+                    )
                     return TriggerResult.WAIT
             if self.auto.set_charge_limit:
                 await self.client.set_charge_limit(self.auto.set_charge_limit)
             await self.client.start_charging()
         except AUTH_ERRORS as exc:
             LOGGER.error("authentication failed: %s; re-run 'tesla auth login'", exc)
+            await self._notify(
+                "auth_failed",
+                f"authentication failed: {exc}; re-run 'tesla auth login'",
+                priority=5,
+                tags=("rotating_light",),
+            )
             raise _ExitCode(2) from exc
         except (TeslaFleetError, aiohttp.ClientError) as exc:
             if self.once:
                 LOGGER.error("trigger failed: %s", exc)
+                await self._notify(
+                    "trigger_failed",
+                    f"charge trigger failed: {exc}",
+                    priority=4,
+                    tags=("warning",),
+                )
                 raise _ExitCode(3) from exc
             LOGGER.warning("trigger failed: %s", exc)
+            await self._notify(
+                "trigger_failed",
+                f"charge trigger failed: {exc}",
+                priority=4,
+                tags=("warning",),
+            )
             return TriggerResult.RETRY
         if await self.client.verify_charging():
             LOGGER.info("charging started")
             return TriggerResult.STARTED
         LOGGER.error("charge_start was sent but the vehicle is not charging")
+        await self._notify(
+            "trigger_failed",
+            "charge_start was sent but the vehicle is not charging",
+            priority=4,
+            tags=("warning",),
+        )
         raise _ExitCode(3)
 
 
@@ -360,6 +516,7 @@ async def watch(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], float] = time.monotonic,
     jitter: Callable[[float, float], float] = random.uniform,
+    notifier=None,
 ) -> int:
     """Poll and trigger once; returns the process exit code (0/2/3)."""
     charger = AutoCharger(
@@ -370,18 +527,26 @@ async def watch(
         sleep=sleep,
         clock=clock,
         jitter=jitter,
+        notifier=notifier,
     )
     return await charger.run()
 
 
 async def run(
-    client, config: Config, *, dry_run: bool = False, once: bool = False
+    client,
+    config: Config,
+    *,
+    dry_run: bool = False,
+    once: bool = False,
+    notifier=None,
 ) -> int:
     """Run the watch loop with SIGINT/SIGTERM handling; returns exit code."""
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     installed: list[int] = []
-    watch_task = asyncio.create_task(watch(client, config, dry_run=dry_run, once=once))
+    watch_task = asyncio.create_task(
+        watch(client, config, dry_run=dry_run, once=once, notifier=notifier)
+    )
     stopper = asyncio.create_task(stop.wait())
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -399,6 +564,13 @@ async def run(
         with suppress(asyncio.CancelledError):
             await watch_task
         LOGGER.info("stopped by signal")
+        if notifier is not None and not dry_run:
+            await notifier.send(
+                "stopped",
+                "watch stopped by signal",
+                priority=3,
+                tags=["stop_sign"],
+            )
         return 0
     finally:
         for sig in installed:

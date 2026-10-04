@@ -56,14 +56,14 @@ the vehicle and Powerwall.
    `https://developer.tesla.com/request`).
 3. Use these settings:
 
-| Field | Value |
-|---|---|
-| Registration type | Just for me (personal account) |
-| Application name | anything, e.g. `HomeCLI` |
-| OAuth grant type | **Authorization Code and Machine-to-Machine** |
-| Allowed origin | `https://your-domain.example` (scheme + host only, no path) |
-| Allowed redirect URI | `http://localhost:8085/callback` (localhost is exempt from Tesla's HTTPS rule) |
-| Scopes | `user_data`, `vehicle_device_data`, `vehicle_cmds`, `vehicle_charging_cmds`, `energy_device_data` (`openid`/`offline_access` are implicit) |
+| Field                | Value                                                                                                                                      |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Registration type    | Just for me (personal account)                                                                                                             |
+| Application name     | anything, e.g. `HomeCLI`                                                                                                                   |
+| OAuth grant type     | **Authorization Code and Machine-to-Machine**                                                                                              |
+| Allowed origin       | `https://your-domain.example` (scheme + host only, no path)                                                                                |
+| Allowed redirect URI | `http://localhost:8085/callback` (localhost is exempt from Tesla's HTTPS rule)                                                             |
+| Scopes               | `user_data`, `vehicle_device_data`, `vehicle_cmds`, `vehicle_charging_cmds`, `energy_device_data` (`openid`/`offline_access` are implicit) |
 
 4. Billing: personal use includes a $10/month credit; vehicle data and
    command calls draw it down while energy-product APIs are free. A
@@ -81,17 +81,17 @@ included.
 1. Generate the EC P-256 key (written to
    `~/.config/tesla/private_key.pem`, mode 0600) and print the public
    half:
-
+   
    ```sh
    uv run tesla key generate --pem-only > /tmp/tesla-public-key.pem
    ```
 
 2. Upload that file to the domain from step 3, exactly at:
-
+   
    ```
    https://your-domain.example/.well-known/appspecific/com.tesla.3p.public-key.pem
    ```
-
+   
    It must be served over HTTPS, without redirects, byte-for-byte. Keep
    it online permanently — registration and vehicle pairing fetch it.
    The public host only serves this file; the private key stays on the
@@ -99,13 +99,13 @@ included.
 
 3. Set the domain and register the app with Tesla (uses the
    client-credentials grant):
-
+   
    ```sh
    uv run tesla config set domain your-domain.example
    uv run tesla key register
    uv run tesla key status
    ```
-
+   
    `key status` compares the local, Tesla-registered, and hosted keys. To
    use signed commands, pair the virtual key once per vehicle: open
    `https://tesla.com/_ak/your-domain.example` on a phone with the Tesla
@@ -143,6 +143,16 @@ require_plugged = true
 wake_timeout_seconds = 90
 set_charge_limit = 0           # 0 = leave unchanged
 max_runtime_hours = 0          # 0 = unlimited
+
+[notify]
+enabled = false
+url = "https://ntfy.sh"        # or a self-hosted server
+priority = 3                   # default notification priority (1-5)
+tags = "tesla"                 # comma-separated, emoji shortcodes allowed
+min_priority = 1               # drop stages with a lower priority
+verbose = false                # true = ignore cooldowns (observation mode)
+# The topic and token are credentials and live in the environment:
+#   TESLA_NTFY_TOPIC, TESLA_NTFY_TOKEN (optional), TESLA_NTFY_URL (optional)
 ```
 
 `tesla products` lists the VIN and energy site ID to use here. Unknown
@@ -221,11 +231,11 @@ only the private key and tokens move to the server.
 All three options run the same command; the lock file keeps them from
 overlapping, so pick one and don't mix.
 
-| Option | How it works | Pros | Cons |
-|---|---|---|---|
-| systemd timer + `--once` (recommended) | systemd launches `tesla auto-charge --once` every 5 min | No resident process; journald logs; survives reboot; cadence easy to change; no restart-semantics trap | Up to one interval of detection latency; process starts and refreshes the token each tick |
-| systemd resident service | systemd runs `tesla auto-charge` continuously | Lowest latency; token refreshed only ~every 8 h; one process to watch | Must use `Restart=always` to re-arm after a trigger; long-lived process; re-checks after success |
-| cron | cron runs `tesla auto-charge --once` on a schedule | Universally available; no systemd/linger; trivial to set up | Minimal environment; DIY log redirection; no journald or hardening; no catch-up after downtime |
+| Option                                 | How it works                                            | Pros                                                                                                   | Cons                                                                                             |
+| -------------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| systemd timer + `--once` (recommended) | systemd launches `tesla auto-charge --once` every 5 min | No resident process; journald logs; survives reboot; cadence easy to change; no restart-semantics trap | Up to one interval of detection latency; process starts and refreshes the token each tick        |
+| systemd resident service               | systemd runs `tesla auto-charge` continuously           | Lowest latency; token refreshed only ~every 8 h; one process to watch                                  | Must use `Restart=always` to re-arm after a trigger; long-lived process; re-checks after success |
+| cron                                   | cron runs `tesla auto-charge --once` on a schedule      | Universally available; no systemd/linger; trivial to set up                                            | Minimal environment; DIY log redirection; no journald or hardening; no catch-up after downtime   |
 
 ### Schedule it with systemd (recommended)
 
@@ -287,21 +297,22 @@ use `Restart=always` with `RestartSec=300` or prefer the timer.
 
 ## Commands
 
-| Command | Purpose |
-|---|---|
-| `tesla auth login [--listen]` | Headless OAuth; saves the refresh token |
-| `tesla auth status` | Token validity; refreshes and persists rotation |
-| `tesla auth logout` | Delete the local token (does not revoke it) |
-| `tesla products` | List vehicles and energy sites with IDs |
-| `tesla powerwall status [--watch]` | Battery %, reserve, grid status |
-| `tesla car status` | Battery, range, charging state, plug, charge limit |
-| `tesla car charge start` / `stop` | Start/stop charging (wakes the car) |
-| `tesla car charge limit <pct>` | Set the charge limit (0–100) |
-| `tesla auto-charge [flags]` | Watch the Powerwall and trigger once |
-| `tesla key generate` / `register` / `status` | EC key and registration |
-| `tesla config show` / `set` | View/update configuration |
-| `tesla doctor` | Check config, credentials, auth, IDs, connectivity |
-| `tesla --version` | Print the version |
+| Command                                      | Purpose                                            |
+| -------------------------------------------- | -------------------------------------------------- |
+| `tesla auth login [--listen]`                | Headless OAuth; saves the refresh token            |
+| `tesla auth status`                          | Token validity; refreshes and persists rotation    |
+| `tesla auth logout`                          | Delete the local token (does not revoke it)        |
+| `tesla products`                             | List vehicles and energy sites with IDs            |
+| `tesla powerwall status [--watch]`           | Battery %, reserve, grid status                    |
+| `tesla car status`                           | Battery, range, charging state, plug, charge limit |
+| `tesla car charge start` / `stop`            | Start/stop charging (wakes the car)                |
+| `tesla car charge limit <pct>`               | Set the charge limit (0–100)                       |
+| `tesla auto-charge [flags]`                  | Watch the Powerwall and trigger once               |
+| `tesla key generate` / `register` / `status` | EC key and registration                            |
+| `tesla config show` / `set`                  | View/update configuration                          |
+| `tesla notify test` / `reset` | Send a test notification / clear cooldowns |
+| `tesla doctor`                               | Check config, credentials, auth, IDs, connectivity |
+| `tesla --version`                            | Print the version                                  |
 
 Global flags: `-v`/`-vv` for INFO/DEBUG logging, `--log-file FILE` to log
 to a file instead of stderr.
@@ -313,14 +324,14 @@ token, then polls the Powerwall every `poll_interval_seconds`. Below the
 threshold it only reads the Powerwall. At the threshold it reads the car
 and acts on this table:
 
-| Powerwall | Vehicle | `require_plugged` | Action |
-|---|---|---|---|
-| >= threshold | Charging / Complete | any | done, exit 0 |
-| >= threshold | Disconnected | true | wait for plug |
-| >= threshold | Stopped / NoPower | any | wake, set limit, `charge_start` |
-| >= threshold | asleep (offline) | true | wait, do not wake |
-| >= threshold | asleep (offline) | false | wake and start |
-| < threshold | any | any | sleep |
+| Powerwall    | Vehicle             | `require_plugged` | Action                          |
+| ------------ | ------------------- | ----------------- | ------------------------------- |
+| >= threshold | Charging / Complete | any               | done, exit 0                    |
+| >= threshold | Disconnected        | true              | wait for plug                   |
+| >= threshold | Stopped / NoPower   | any               | wake, set limit, `charge_start` |
+| >= threshold | asleep (offline)    | true              | wait, do not wake               |
+| >= threshold | asleep (offline)    | false             | wake and start                  |
+| < threshold  | any                 | any               | sleep                           |
 
 After a start it verifies `Charging` with a follow-up read and exits 0
 (it never stays resident to stop charging later). Transient API errors
@@ -330,6 +341,81 @@ after 5 consecutive failures. Exit codes: `0` triggered/nothing to do,
 
 Flags: `--threshold N`, `--interval S`, `--dry-run` (never wakes or
 commands), `--once` (one evaluation pass, no sleeping).
+
+## Notifications with ntfy
+
+The CLI can push [ntfy](https://ntfy.sh) notifications at each
+auto-charge stage and after manual charging commands.
+
+### Get started
+
+1. Install the ntfy app ([Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy), [iOS](https://apps.apple.com/us/app/ntfy/id1625396347)) or open the web app at <https://ntfy.sh/app>, and subscribe to a topic.
+
+2. Pick a hard-to-guess topic. On public ntfy.sh the topic name is
+   effectively a **password** — anyone who knows it can read your
+   notifications. The web app includes a topic generator.
+
+3. Put the credentials in `.env` next to the Tesla ones (or export them):
+   
+   ```shell
+   TESLA_NTFY_TOPIC=tesla-<unguessable>
+   # optional, for a protected topic or self-hosted server:
+   TESLA_NTFY_TOKEN=tk_...
+   TESLA_NTFY_URL=https://ntfy.example.com
+   ```
+
+4. Enable it and send a test:
+   
+   ```shell
+   uv run tesla config set notify.enabled true
+   uv run tesla notify test
+   ```
+
+### What gets sent
+
+| Stage | When | Priority |
+|---|---|---|
+| started | watch loop begins (12 h cooldown) | 2 |
+| threshold | Powerwall reached the threshold (6 h) | 4 |
+| wait_plug | at threshold but unplugged/asleep with `require_plugged` (2 h) | 3 |
+| charging | `charge_start` verified `Charging` | 4 |
+| already_charging | vehicle already charging/complete (24 h) | 2 |
+| trigger_failed / poll_failed | wake, command, verification, or poll error | 4 / 3 |
+| gave_up | 5 consecutive failures | 5 |
+| auth_failed | token problem; re-run `tesla auth login` | 5 |
+| max_runtime | `max_runtime_hours` reached before a trigger | 4 |
+| stopped | SIGINT/SIGTERM in resident mode | 3 |
+| manual | after `car charge start` / `stop` / `limit` | 3 |
+
+Repeated conditions are suppressed using
+`~/.config/tesla/notify_state.json`, so the 5-minute systemd timer stays
+far below ntfy.sh's 250 messages/day. A verified charge start clears the
+condition cooldowns so the next day notifies fresh. `--dry-run` sends
+nothing, and a failed publish is logged and ignored — it never affects
+the watch loop.
+
+### Tuning what you get
+
+- `notify.min_priority` drops lower-value stages. For example,
+  `tesla config set notify.min_priority 4` leaves only threshold,
+  charging, trigger_failed, max_runtime, and the priority-5 failures.
+- `notify.verbose true` ignores all cooldowns so every stage is sent
+  every run — handy while learning what the service does. Turn it back
+  off for normal operation. `tesla notify reset` clears the saved
+  cooldown state (useful to re-see a stage immediately).
+- `notify.tags` and the per-stage tags render as emoji/text prefixes and
+  are the easiest visual classifier (`battery`, `electric_plug`, `zap`,
+  `warning`, `rotating_light`).
+
+iPhone note: the ntfy iOS app has no per-priority channels and cannot
+pause a subscription (Android can), so every ntfy alert looks and sounds
+the same at the iOS level. Tune on the server with the settings above
+rather than in the app; Android users additionally get per-priority
+notification channels they can customize.
+
+Verbose mode on a 5-minute timer would exceed ntfy.sh's 250 messages/day
+— use manual `--once` runs while observing, or temporarily lengthen
+`OnUnitActiveSec`.
 
 ## Troubleshooting
 

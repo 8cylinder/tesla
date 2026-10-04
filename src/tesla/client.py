@@ -75,6 +75,14 @@ def _first(*values: str | None) -> str | None:
     return None
 
 
+def env_value(name: str, environ: Mapping[str, str] | None = None) -> str | None:
+    """Return a value from the environment or the .env files, env first."""
+    env = os.environ if environ is None else environ
+    if env.get(name):
+        return env[name]
+    return _dotenv_values().get(name)
+
+
 def load_credentials(
     *,
     client_id: str | None = None,

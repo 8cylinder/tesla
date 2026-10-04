@@ -41,6 +41,10 @@ def lock_path() -> Path:
     return config_dir() / "auto-charge.lock"
 
 
+def notify_state_path() -> Path:
+    return config_dir() / "notify_state.json"
+
+
 @dataclass
 class VehicleConfig:
     vin: str | None = None
@@ -64,12 +68,23 @@ class AutoChargeConfig:
 
 
 @dataclass
+class NotifyConfig:
+    enabled: bool = False
+    url: str = "https://ntfy.sh"
+    priority: int = 3
+    tags: str = "tesla"
+    min_priority: int = 1
+    verbose: bool = False
+
+
+@dataclass
 class Config:
     region: str = "na"
     domain: str | None = None
     vehicle: VehicleConfig = field(default_factory=VehicleConfig)
     powerwall: PowerwallConfig = field(default_factory=PowerwallConfig)
     auto_charge: AutoChargeConfig = field(default_factory=AutoChargeConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
 
 
 def key_path(config: Config) -> Path:
@@ -97,6 +112,14 @@ _SCHEMA: dict[str, Any] = {
         "wake_timeout_seconds": int,
         "set_charge_limit": int,
         "max_runtime_hours": float,
+    },
+    "notify": {
+        "enabled": bool,
+        "url": str,
+        "priority": int,
+        "tags": str,
+        "min_priority": int,
+        "verbose": bool,
     },
 }
 
@@ -149,6 +172,12 @@ def _check_values(config: Config) -> None:
         raise ConfigError("auto_charge.set_charge_limit must be in [0, 100]")
     if config.auto_charge.max_runtime_hours < 0:
         raise ConfigError("auto_charge.max_runtime_hours must be >= 0")
+    if not 1 <= config.notify.priority <= 5:
+        raise ConfigError("notify.priority must be in [1, 5]")
+    if not 1 <= config.notify.min_priority <= 5:
+        raise ConfigError("notify.min_priority must be in [1, 5]")
+    if not config.notify.url:
+        raise ConfigError("notify.url must not be empty")
 
 
 def _build(data: dict[str, Any]) -> Config:
@@ -160,6 +189,8 @@ def _build(data: dict[str, Any]) -> Config:
         setattr(config.powerwall, key, value)
     for key, value in (data.get("auto_charge") or {}).items():
         setattr(config.auto_charge, key, value)
+    for key, value in (data.get("notify") or {}).items():
+        setattr(config.notify, key, value)
     _check_values(config)
     return config
 
@@ -261,6 +292,14 @@ def dump_toml(config: Config) -> str:
         f"wake_timeout_seconds = {_toml(auto.wake_timeout_seconds)}",
         f"set_charge_limit = {_toml(auto.set_charge_limit)}",
         f"max_runtime_hours = {_toml(auto.max_runtime_hours)}",
+        "",
+        "[notify]",
+        f"enabled = {_toml(config.notify.enabled)}",
+        f"url = {_toml(config.notify.url)}",
+        f"priority = {_toml(config.notify.priority)}",
+        f"tags = {_toml(config.notify.tags)}",
+        f"min_priority = {_toml(config.notify.min_priority)}",
+        f"verbose = {_toml(config.notify.verbose)}",
     ]
     return "\n".join(lines) + "\n"
 
