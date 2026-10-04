@@ -26,30 +26,50 @@ Out of scope for v0.1 (possible follow-ups): telemetry streaming,
 BLE, scheduling, multiple vehicles/sites, notifications, web UI.
 
 * Decisions
-| Topic             | Decision                                                                                      |
-|-------------------+-----------------------------------------------------------------------------------------------|
-| Python            | =3.13= --- floor required by the latest =tesla-fleet-api=; uv owns the interpreter                |
-| Dependencies      | Track latest =tesla-fleet-api= (>= 1.15); commit =uv.lock=; bump the Python floor with it         |
-| Region            | =na=                                                                                            |
-| Developer app     | One-time registration at =developer.tesla.com/request=; $10/month personal credit; scopes below |
-| Command transport | Config toggle =fleet= (unsigned) / =signed=; default =signed=                                   |
-| Read path         | =vehicle_data(endpoints=["charge_state"])= for both transports; =charge_state()= is BLE-only      |
-| Watch behavior    | Trigger once, then exit                                                                       |
-| Secret storage    | =config.toml= (0644) + =tokens.json= (0600), client ID/secret from env or =.env=                    |
-| CLI framework     | Click                                                                                         |
-| Poll interval     | 300 s default, configurable                                                                   |
-| Backoff           | 5 s initial, x2, cap 300 s, +/-20% jitter, give up after 5 consecutive failures               |
-| Distribution name | =tesla-cli= (module and executable: =tesla=); pyproject says =tesla= today, fix in M1               |
-| Error handling    | Catch =TeslaFleetError= explicitly --- it subclasses =BaseException=, not =Exception=               |
+| Topic             | Decision                                                                                                                                                                                               |
+|-------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Python            | =3.13= --- floor required by the latest =tesla-fleet-api=; uv owns the interpreter                                                                                                                         |
+| Dependencies      | Track latest =tesla-fleet-api= (>= 1.15); commit =uv.lock=; bump the Python floor with it                                                                                                                  |
+| Region            | =na=                                                                                                                                                                                                     |
+| Developer app     | =HomeCLI= (personal, Active) at developer.tesla.com; OAuth =Authorization Code and Machine-to-Machine=; origin =https://8cylinder.com=; redirect =http://localhost:8085/callback=; custom billing limit $10/mo |
+| Command transport | Config toggle =fleet= (unsigned) / =signed=; default =signed=                                                                                                                                                |
+| Read path         | =vehicle_data(endpoints=["charge_state"])= for both transports; =charge_state()= is BLE-only                                                                                                               |
+| Watch behavior    | Trigger once, then exit                                                                                                                                                                                |
+| Secret storage    | =config.toml= (0644) + =tokens.json= (0600), client ID/secret from env or =.env=                                                                                                                             |
+| CLI framework     | Click                                                                                                                                                                                                  |
+| Poll interval     | 300 s default, configurable                                                                                                                                                                            |
+| Backoff           | 5 s initial, x2, cap 300 s, +/-20% jitter, give up after 5 consecutive failures                                                                                                                        |
+| Distribution name | =tesla= (project, module, executable); user decision in M1 --- no rename to =tesla-cli=                                                                                                                  |
+| Error handling    | Catch =TeslaFleetError= explicitly --- it subclasses =BaseException=, not =Exception=                                                                                                                        |
 
 * Tesla developer app (one-time setup)
 Authentication requires a Tesla developer application registered to the
 same Tesla account that owns the car and Powerwall. Steps (see
 [[https://developer.tesla.com/request][developer.tesla.com/request]]):
 
-1. [ ] Tesla account with a verified email, owning the vehicle and Powerwall.
-2. [ ] Create the application, then copy the Client ID and Client Secret
-   (dashboard -> View Details -> Credentials & APIs):
+** Registered application (HomeCLI)
+| Field                | Value                                                                                                                      |
+|----------------------+----------------------------------------------------------------------------------------------------------------------------|
+| Registration type    | Just for me (personal account)                                                                                             |
+| Application name     | =HomeCLI=                                                                                                                    |
+| Description          | Personal CLI that monitors my Tesla Powerwall and vehicle.                                                                 |
+| Status               | Active (approved)                                                                                                          |
+| OAuth grant type     | Authorization Code and Machine-to-Machine                                                                                  |
+| Allowed origin       | =https://8cylinder.com=                                                                                                      |
+| Allowed redirect URI | =http://localhost:8085/callback=                                                                                             |
+| Scopes registered    | =user_data=, =vehicle_device_data=, =vehicle_cmds=, =vehicle_charging_cmds=, =energy_device_data= (=openid=/=offline_access= implicit) |
+| Scopes not used      | =vehicle_location=, =energy_cmds=                                                                                              |
+| Billing              | Custom limit *$10/mo*; Visa on file (####6783); energy APIs free                                                             |
+
+=HomeCLI= is the *Tesla developer application* name; the distribution
+name (project, module, and executable) remains =tesla=.
+
+Steps:
+
+1. [X] Tesla account with a verified email, owning the vehicle and Powerwall.
+2. [X] Create the application, then copy the Client ID and Client Secret
+   (dashboard -> View Details -> Credentials & APIs). =HomeCLI= is Active;
+   Client ID/Secret are stored in =.env= (=.env.example= has placeholders):
    - OAuth grant type: *Authorization Code and Machine-to-Machine*
      (required for refresh tokens).
    - Allowed origin: =https://8cylinder.com= (scheme + host only, no
@@ -58,20 +78,24 @@ same Tesla account that owns the car and Powerwall. Steps (see
    - Allowed redirect URI: =http://localhost:8085/callback= (localhost
      is exempt from Tesla's HTTPS redirect rule).
    - Scopes: the list below.
-3. [ ] Billing: personal use includes a $10/month credit; vehicle data and
+3. [X] Billing: personal use includes a $10/month credit; vehicle data and
    command calls draw it down while energy-product APIs are free. A
    payment method is only needed if usage exceeds the credit; the
-   developer dashboard shows current usage.
-4. [ ] Signed commands only (=fleet= mode skips this, newer vehicles and any
-   long-term path require it):
+   developer dashboard shows current usage. Configured as *Custom Limit
+   $10/mo* with a Visa on file.
+4. [ ] Developer registration and key pairing. *Registration is required
+   before any Fleet API call, even read-only ones* --- =products= returns
+   412 Precondition Failed until the app is registered (confirmed live in
+   M2). Pairing is additionally required for signed commands:
    - Generate an EC P-256 key (=tesla key generate=, library
      =await get_private_key(path)=).
    - Host the public key at
      =https://8cylinder.com/.well-known/appspecific/com.tesla.3p.public-key.pem=.
      Keep it online permanently: registration and pairing fetch it, and
      re-pairing or adding vehicles later needs the same URL live.
-   - Register the domain with Tesla
-     (=oauth.partner.register("8cylinder.com")=).
+   - Register the domain with Tesla (partner token via
+     =oauth.partner_login()=, then
+     =oauth.partner.register("8cylinder.com")=).
    - Pair the virtual key per vehicle: open
      =https://tesla.com/_ak/8cylinder.com= on a phone with the Tesla app.
    - Trust model: the private host only makes outbound HTTPS calls to
@@ -80,6 +104,18 @@ same Tesla account that owns the car and Powerwall. Steps (see
      vehicle's whitelist and is not re-fetched per command.
    - If pairing proves impossible, unsigned =fleet= mode remains the
      fallback.
+
+** Registered Application Info
+This is the info from the Tesla app "Credentials & APIs" page.
+https://developer.tesla.com/dashboard (the app id matches =TESLA_CLIENT_ID=
+in =.env=)
+
+- Client Secret :: stored in =.env= as =TESLA_CLIENT_SECRET= (never commit)
+- Client ID :: stored in =.env= as =TESLA_CLIENT_ID=
+- OAuth Grant Type :: client-credentials, authorization-code
+- Allowed Origin(s) :: https://8cylinder.com
+- Allowed Redirect URI(s) :: http://localhost:8085/callback
+- Allowed Returned URL(s) :: No returned URL(s) added
 
 * Headless OAuth
 The server has SSH only, no browser and no public ingress. Use *manual
@@ -117,12 +153,14 @@ write the same token file.
 Requested scopes:
 
 #+begin_src python
-["openid", "offline_access", "vehicle_device_data", "vehicle_cmds",
- "vehicle_charging_cmds", "energy_device_data"]
+["openid", "offline_access", "user_data", "vehicle_device_data",
+ "vehicle_cmds", "vehicle_charging_cmds", "energy_device_data"]
 #+end_src
 
-=vehicle_cmds= is included for =wake_up()=; add =user_data= if
-=products()= returns 403 (verify during M2).
+=openid= and =offline_access= are implicit in the Authorization Code
+grant. =vehicle_cmds= is included for =wake_up()=. =user_data= is
+requested up front (registered in the app), removing the earlier "add
+only if =products()= 403" fallback.
 
 * Architecture
 #+begin_src
@@ -171,11 +209,12 @@ Client factory notes:
 
 #+begin_src toml
 region = "na"
+domain = "8cylinder.com"     # app root domain (partner registration)
 
 [vehicle]
 vin = "5YJ..."
 command_mode = "signed"       # or "fleet" (unsigned fallback)
-key_path = "~/.config/tesla/private_key.pem"
+key_path = "~/.config/tesla/private_key.pem"  # optional; defaults to config dir
 
 [powerwall]
 energy_site_id = 123456789
@@ -221,7 +260,7 @@ max_runtime_hours = 0         # 0 = unlimited
 | =tesla config show / set=                | View/update config                                     |
 | =tesla key generate / register / status= | EC key creation; =partner.register()=; =fleet_status()=    |
 | =tesla doctor=                           | Validate config, auth, connectivity, IDs, scopes       |
-| =tesla --version=                        | =importlib.metadata.version("tesla-cli")=                |
+| =tesla --version=                        | =importlib.metadata.version("tesla")=                    |
 
 =auto-charge= flags: =--threshold N=, =--interval S=, =--dry-run=, =--once=.
 =--once= performs a single evaluation pass and exits instead of looping
@@ -331,34 +370,63 @@ README documents:
   service is running.
 
 * Milestones
-** TODO M0 --- Tesla developer app (manual, user)
+** DONE M0 --- Tesla developer app (manual, user)
 Create the app at =developer.tesla.com/request= with redirect
 =http://localhost:8085/callback=, origin =https://8cylinder.com=, and the
 scopes above.
 
-/Done when:/ Client ID and Client Secret are stored in =.env=.
+/Actual:/ Created =HomeCLI= (personal, Active) with OAuth *Authorization
+Code and Machine-to-Machine*, origin =https://8cylinder.com=, redirect
+=http://localhost:8085/callback=, and scopes =user_data=,
+=vehicle_device_data=, =vehicle_cmds=, =vehicle_charging_cmds=,
+=energy_device_data=; billing set to a *$10/mo custom limit*. Client ID,
+Client Secret, and redirect URI stored in =.env=; =.env.example= holds
+placeholders. Credentials scrubbed from this tracked file.
+
+/Done when:/ Client ID and Client Secret are stored in =.env=. [X]
 
 /See:/ [[*Tesla developer app (one-time setup)]], [[*Decisions]].
 
-** TODO M1 --- Scaffold
-=uv init= (Python 3.13), dependencies, rename distribution to =tesla-cli=,
-fix the =tesla.cli:main= entry point, CLI skeleton, config + token
-persistence.
+** DONE M1 --- Scaffold
+Python 3.13 via uv, dependencies added, entry point
+=tesla = "tesla.cli:main"=, CLI skeleton, config + token persistence.
+Distribution stays =tesla= (user decision, no rename to =tesla-cli=).
+
+/Actual:/ =pyproject.toml= name =tesla=, =requires-python >=3.13=,
+deps =aiohttp=, =click=, =python-dotenv=, =rich=, =tesla-fleet-api>=1.15=
+(lock resolves 1.17.2); dev group =pytest=, =pytest-asyncio=, =ruff=.
+Added =src/tesla/{__init__,__main__,cli,config,tokens,logging}.py= and
+=tests/{conftest,test_config,test_tokens,test_cli}.py=. =TESLA_CONFIG_DIR=
+overrides the state directory (used by tests). =config set= writes TOML
+atomically; token writes are atomic and 0600-checked.
+
 /Done when:/ =uv run tesla --version= prints 0.1.0; =config show= and
-round-trip token load/save tests pass under ruff and pytest.
+round-trip token load/save tests pass under ruff and pytest. [X] ---
+26 tests, ruff clean.
 
 /See:/ [[*Architecture]], [[*Configuration and tokens]].
 
-** TODO M2 --- Auth
+** DONE M2 --- Auth
 Headless =auth login= / =auth status=, token refresh + rotation
 persistence, client factory, =products= smoke test and scope
 verification.
 /Done when:/ a real login saves =tokens.json= (0600); =auth status=
 refreshes and rewrites it; =products= lists the configured IDs.
 
+/Actual:/ Implemented =client.py= (credential precedence, =oauth_client=,
+=ensure_fresh_token= with rotation persistence, =exchange_code=,
+=parse_callback=) and CLI =auth login [--listen]=, =auth status=, and
+=products=. Auth/config faults exit 2, API errors exit 3. 43 tests, ruff
+clean. Library 1.17.2 behavior verified: =get_refresh_token()= returns
+=None= and silently no-ops on a non-OK response, and =refresh_access_token()=
+raises =ValueError= rather than =TeslaFleetError=; both are handled and
+surfaced as =AuthError=. Live login and =auth status= succeeded;
+=products= returned 412 until partner registration (M3) ran. Once
+registered, =products= lists the VIN and energy site ID. M2 complete.
+
 /See:/ [[*Headless OAuth]], [[*Tesla developer app (one-time setup)]].
 
-** TODO M3 --- Key and pairing
+** DONE M3 --- Key and pairing
 =key generate= (=get_private_key()=), upload the public key to
 =https://8cylinder.com/.well-known/appspecific/com.tesla.3p.public-key.pem=,
 =key register= (=partner.register("8cylinder.com")=), pair the vehicle via
@@ -367,9 +435,33 @@ Keep the public key file hosted for the life of the app.
 /Done when:/ =key status= reports the vehicle accepts the partner key and
 the hosted URL serves the exact public PEM.
 
+/Actual:/ Implemented =key generate [--pem-only]= (creates/loads the EC
+P-256 key at =key_path=, default =~/.config/tesla/private_key.pem=,
+=TESLA_CONFIG_DIR= aware), =key register [--domain]= (partner token via
+=partner_login(client_credentials)=; sets =expires= because the library
+leaves it at 0 and the next call would otherwise try a user-token refresh
+and clobber the partner token), and =key status= (compares local,
+Tesla-registered, and hosted PEMs; runs =fleet_status= when VIN and user
+tokens exist). New top-level =domain= config key. 57 tests, ruff clean.
+
+/Live:/ Key generated on the host, public PEM hosted at the well-known
+URL (verified: HTTP 200, no redirects, valid P-256), and =key register=
+succeeded. Tesla returns the registered key as an uncompressed point hex
+(=04...=), so =key status= compares normalized points, not PEM text;
+hosted PEM and registered point match. =partner_accounts/public_key=
+requires =vehicle_device_data= on the partner token; partner tokens now
+request =openid + vehicle_device_data=. Remaining: pair the vehicle
+(=https://tesla.com/_ak/8cylinder.com= on a phone) and re-run =key
+status= so =fleet_status= reports acceptance.
+
+/Live result:/ =key status= reports local present, Tesla registered
+matches, hosted URL matches. =fleet_status= shows the VIN in
+=key_paired_vins= with =vehicle_command_protocol_required: true= --- so
+signed mode is the correct default. M3 complete.
+
 /See:/ [[*Tesla developer app (one-time setup)]], [[*Decisions]].
 
-** TODO M4 --- Read-only commands
+** NEXT M4 --- Read-only commands
 =products=, =powerwall status=, =car status=.
 /Done when:/ each prints the fields in the CLI table; missing IDs exit 2
 with a clear message; powerwall ratio fallback covered by tests.
@@ -415,20 +507,25 @@ verifies =Charging= with a second read; commands are never resent;
   =signed= is the default and M3 sets it up; =fleet= remains a fallback
   for older vehicles or if pairing fails. =vehicle.fleet_status([vin])=
   reports whether the car accepts the partner key.
-- *Documentation drift.* The library README/docs show =handshake()= while
-  1.15.0 exposes =handshakeVehicleSecurity()= and =handshakeInfotainment()=;
-  re-check the installed version before M3/M6.
+- *Documentation drift.* Verified against 1.17.2 in M2: =Scope= is a
+  =StrEnum= in =tesla_fleet_api.const= (not exported top-level);
+  =get_refresh_token()= returns =None= and silently ignores a non-OK
+  response; the refresh path raises =ValueError=, not =TeslaFleetError=.
+  Still to verify in M3: =handshakeVehicleSecurity()= vs the docs'
+  =handshake()=.
 - *Unsigned command longevity.* Tesla is steering integrations toward
   signed commands / Fleet Telemetry; =fleet= mode may be deprecated
   eventually. Keep the transport toggle thin so a switch is cheap.
-- *Scope uncertainty.* =wake_up= is believed to need =vehicle_cmds= and
-  =products= may need =user_data=; confirm on first live run and update
-  the scopes list.
+- *Scope uncertainty.* =wake_up= is believed to need =vehicle_cmds=;
+  confirm on first live command. =products= needed partner registration,
+  not a scope change. Partner tokens need =vehicle_device_data= for
+  =partner_accounts/public_key= (=openid= alone returns 403), while
+  =register= works with =openid=.
 - Confirm =percentage_charged= is present in your site's =live_status=
   during implementation; the energy-ratio fallback covers it if not.
 - *Refresh-token rotation races* between the service and manual commands;
   mitigated by the lock file and the "no concurrent =auth status=" rule.
-- Distribution name =tesla-cli= vs =tesla= (PyPI collision) is
-  irrelevant unless the package is published.
+- Project name =tesla= collides with an existing PyPI name; irrelevant
+  unless the package is published (executable stays =tesla=).
 - Charging commands are not idempotent; the loop starts charging at most
   once and exits.
