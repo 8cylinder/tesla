@@ -251,6 +251,7 @@ max_runtime_hours = 0         # 0 = unlimited
 |----------------------------------------+--------------------------------------------------------|
 | =tesla auth login [--listen]=            | Headless OAuth; saves refresh token                    |
 | =tesla auth status=                      | Token validity, refreshes if needed, persists rotation |
+| =tesla auth logout=                      | Delete local token (no server-side revoke)             |
 | =tesla products=                         | List vehicles and energy sites with VIN/site IDs       |
 | =tesla powerwall status [--watch]=       | =percentage_charged=, reserve, grid status               |
 | =tesla car status=                       | Battery %, charging state, plugged, charge limit       |
@@ -298,15 +299,18 @@ max_runtime_hours = 0         # 0 = unlimited
    file so two loops cannot run.
 
 ** decide() truth table
-=auto_charge.decide(powerwall_pct, charging_state, require_plugged)= is a
-pure function; the loop only performs the returned action.
+=auto_charge.decide(powerwall_pct, threshold, charging_state,
+require_plugged)= is a pure function; the loop only performs the returned
+action.
 
-| PW reading   | charging_state      | require_plugged | Action             |
-|--------------+---------------------+-----------------+--------------------|
+| PW reading   | charging_state      | require_plugged | Action               |
+|--------------+---------------------+-----------------+----------------------|
 | >= threshold | Charging / Complete | any             | =DONE= (exit 0)      |
 | >= threshold | Disconnected        | true            | =WAIT_PLUG=          |
 | >= threshold | Disconnected        | false           | =START= (attempt)    |
 | >= threshold | Stopped / NoPower   | any             | =START= (wake first) |
+| >= threshold | Asleep (read 408)   | true            | =WAIT= (do not wake) |
+| >= threshold | Asleep (read 408)   | false           | =START= (wake first) |
 | >= threshold | unknown / missing   | any             | =WAIT= (log, retry)  |
 | < threshold  | any                 | any             | =SLEEP=              |
 | missing      | any                 | any             | =SLEEP= (log)        |
@@ -357,13 +361,21 @@ pure function; the loop only performs the returned action.
 * Deployment
 README documents:
 
-- A systemd user unit:
-  =ExecStart=%h/.local/bin/tesla auto-charge --log-file %h/.local/state/tesla/auto-charge.log=
-  with =Restart=on-failure=, =RestartSec=60=, =StartLimitIntervalSec=300=,
-  =StartLimitBurst=3=, plus hardening (=NoNewPrivileges=,
-  =PrivateTmp=, =ProtectSystem=strict=,
-  =ReadWritePaths=%h/.config/tesla=); logs via
-  =journalctl --user -u tesla=.
+- A systemd *timer* + oneshot service (recommended, since the loop
+  triggers once and exits 0): =tesla-auto-charge.timer= (=OnBootSec=2min=,
+  =OnUnitActiveSec=5min=, =Persistent=true=) runs
+  =tesla-auto-charge.service= (=Type=oneshot=,
+  =ExecStart=%h/.local/bin/tesla auto-charge --once=,
+  =WorkingDirectory=%h/tesla=); =loginctl enable-linger= keeps it alive
+  without login; logs via =journalctl --user -u tesla-auto-charge=; the
+  lock file prevents overlap.
+- Optional resident service: =ExecStart=%h/.local/bin/tesla auto-charge
+  --log-file %h/.local/state/tesla/auto-charge.log= with
+  =Restart=on-failure=, =RestartSec=60=, =StartLimitIntervalSec=300=,
+  =StartLimitBurst=3=, plus hardening (=NoNewPrivileges=, =PrivateTmp=,
+  =ProtectSystem=strict=, =ReadWritePaths=%h/.config/tesla=). It exits 0
+  after a trigger, so =Restart=on-failure= does not re-arm it --- use
+  =Restart=always= with =RestartSec=300= or prefer the timer above.
 - The headless authentication walkthrough.
 - A cron alternative: hourly =tesla auto-charge --once=.
 - The refresh-token rotation caveat: do not run =auth status= while the
@@ -461,27 +473,65 @@ signed mode is the correct default. M3 complete.
 
 /See:/ [[*Tesla developer app (one-time setup)]], [[*Decisions]].
 
-** NEXT M4 --- Read-only commands
+** DONE M4 --- Read-only commands
 =products=, =powerwall status=, =car status=.
 /Done when:/ each prints the fields in the CLI table; missing IDs exit 2
 with a clear message; powerwall ratio fallback covered by tests.
 
+/Actual:/ =products= implemented in M2. =powerwall status [--watch]
+shows percentage (energy-ratio fallback), backup reserve (from
+=site_info=, which is where the field actually lives), and grid status;
+=car status= shows battery, range, charging state, plug state, and
+charge limit. Pure helpers in =powerwall.py= and =car.py=, covered by
+tests. Live: Powerwall 82.3% / grid Active, car 77% / 189.53 mi /
+Disconnected / limit 100%.
+
 /See:/ [[*CLI surface (v0.1)]], [[*Configuration and tokens]].
 
-** TODO M5 --- Watch loop
+** DONE M5 --- Watch loop
 =auto-charge= with =--dry-run=, =--once=, lock file, signals and backoff;
 unit-tested =decide()=.
 /Done when:/ fake-client tests cover the decide truth table; a dry run
 against the live API logs the correct decision without sending commands.
 
+/Actual:/ =auto_charge.py=: pure =decide()= (index the Asleep row in the
+truth table), =backoff_delay()= (5 s x2, cap 300 s, +/-20%), =LockFile=
+(live PID blocks, stale replaced), =TeslaAutoChargeClient= (=createSigned=
+after =get_private_key()= or =createFleet=; =wake_up(wait=True,
+timeout=)=; 3-attempt charge verification), and signal-aware =run()=.
+CLI =auto-charge [--threshold] [--interval] [--dry-run] [--once]= with
+lock acquire/release and exit codes 0/2/3. 103 tests, ruff clean.
+
+/Live:/ Below-threshold pass logs and exits 0 (no car call). With the car
+asleep and =require_plugged=, the dry run logs 'vehicle asleep, waiting
+for plug (require_plugged)' and sends nothing. When =require_plugged=
+is false the dry run logs the would-wake would-charge decision. Ctrl-C
+logs 'stopped by signal' and exits 0.
+
 /See:/ [[*Core flow: auto-charge]], [[*decide() truth table]], [[*Edge cases and error handling]].
 
-** TODO M6 --- Charging commands and polish
+** NEXT M6 --- Charging commands and polish
 Wake/plug handling and =charge_start= / =charge_stop= / =set_charge_limit=
 over the signed transport, =doctor=, CI, tests, README and systemd docs.
 /Done when:/ a real threshold crossing wakes the car, starts charging, and
 verifies =Charging= with a second read; commands are never resent;
 =doctor= reports config/auth/connectivity; CI is green.
+
+/Actual:/ =client.build_vehicle()= shared by the watch loop and manual
+commands (signed via =createSigned= after =get_private_key=, or
+=createFleet=). CLI =car charge start|stop|limit <pct>= wakes first,
+sends one command, and prints the response; =limit= validates 0-100.
+=doctor= reports config, credentials, tokens, VIN/site id, the private
+key, and a live =products= call with membership checks; exit 2 for
+config/auth problems, 3 when the API check fails. =auth logout= deletes
+the local token (no server-side revoke). CI workflow runs ruff and
+pytest on Python 3.13. README is a step-by-step guide: get the code,
+build, create the Tesla app (settings table), host the public key,
+configure, authorize, deploy to a home server with a systemd timer
+(cron and resident-service alternatives), plus command reference,
+auto-charge semantics, and troubleshooting. 108 tests, ruff clean.
+Pending: the live end-to-end trigger (needs the car plugged in) and a
+live manual command.
 
 /See:/ [[*CLI surface (v0.1)]], [[*Deployment]], [[*Testing]], [[*Risks and open items]].
 
@@ -507,12 +557,13 @@ verifies =Charging= with a second read; commands are never resent;
   =signed= is the default and M3 sets it up; =fleet= remains a fallback
   for older vehicles or if pairing fails. =vehicle.fleet_status([vin])=
   reports whether the car accepts the partner key.
-- *Documentation drift.* Verified against 1.17.2 in M2: =Scope= is a
-  =StrEnum= in =tesla_fleet_api.const= (not exported top-level);
+- *Documentation drift.* Verified against 1.17.2: =Scope= is a =StrEnum=
+  in =tesla_fleet_api.const= (not exported top-level);
   =get_refresh_token()= returns =None= and silently ignores a non-OK
-  response; the refresh path raises =ValueError=, not =TeslaFleetError=.
-  Still to verify in M3: =handshakeVehicleSecurity()= vs the docs'
-  =handshake()=.
+  response; the refresh path raises =ValueError=, not =TeslaFleetError=;
+  =VehicleSigned= signs via the universal-message path and =_command()=
+  auto-handshakes, so no explicit handshake call is needed --- confirm on
+  the first live command in M6.
 - *Unsigned command longevity.* Tesla is steering integrations toward
   signed commands / Fleet Telemetry; =fleet= mode may be deprecated
   eventually. Keep the transport toggle thin so a switch is cheap.
