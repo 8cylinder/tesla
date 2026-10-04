@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,12 @@ from tesla_fleet_api.exceptions import (
 )
 
 from . import __version__
+from .auto_charge import (
+    AlreadyRunning,
+    LockFile,
+    TeslaAutoChargeClient,
+)
+from .auto_charge import run as run_auto_charge
 from .car import charge_state, is_plugged
 from .client import (
     HOSTED_KEY_PATH,
@@ -41,7 +48,14 @@ from .client import (
     register_domain,
     registered_public_key,
 )
-from .config import ConfigError, dump_toml, load_config, save_config, set_dotted
+from .config import (
+    ConfigError,
+    dump_toml,
+    load_config,
+    lock_path,
+    save_config,
+    set_dotted,
+)
 from .logging import setup_logging
 from .powerwall import backup_reserve, grid_status, percentage_charged
 from .tokens import TokenError, Tokens, load_tokens
@@ -385,6 +399,68 @@ def car_status() -> None:
 
         data = asyncio.run(run())
     _render_car(data)
+
+
+@cli.command("auto-charge")
+@click.option(
+    "--threshold",
+    type=click.FloatRange(0.0, 100.0, min_open=True),
+    default=None,
+    help="Override auto_charge.threshold.",
+)
+@click.option(
+    "--interval",
+    type=click.IntRange(min=5),
+    default=None,
+    help="Override the poll interval in seconds.",
+)
+@click.option(
+    "--dry-run", is_flag=True, help="Log the decision without sending commands."
+)
+@click.option("--once", is_flag=True, help="Single evaluation pass, then exit.")
+def auto_charge(
+    threshold: float | None, interval: int | None, dry_run: bool, once: bool
+) -> None:
+    """Watch the Powerwall and start charging once at the threshold."""
+    logging.getLogger("tesla.auto_charge").setLevel(logging.INFO)
+    with _api_errors():
+        config = load_config()
+        if threshold is not None:
+            config.auto_charge.threshold = threshold
+        if interval is not None:
+            config.auto_charge.poll_interval_seconds = interval
+        if config.vehicle.vin is None:
+            _fail("no VIN set; run 'tesla config set vehicle.vin <vin>'")
+        if config.powerwall.energy_site_id is None:
+            _fail(
+                "no energy_site_id set; run "
+                "'tesla config set powerwall.energy_site_id <id>'"
+            )
+        credentials = load_credentials()
+        stored = load_tokens()
+        if stored is None:
+            _fail("not logged in; run 'tesla auth login'")
+
+        lock = LockFile(lock_path())
+        try:
+            lock.acquire()
+        except AlreadyRunning as exc:
+            _fail(str(exc))
+
+        async def run() -> int:
+            async with oauth_client(
+                credentials=credentials, config=config, stored=stored
+            ) as oauth:
+                client = TeslaAutoChargeClient(oauth, config)
+                await client.build()
+                return await run_auto_charge(client, config, dry_run=dry_run, once=once)
+
+        try:
+            code = asyncio.run(run())
+        finally:
+            lock.release()
+    if code:
+        raise SystemExit(code)
 
 
 def _match_status(local_point: str, other: str | None) -> str:

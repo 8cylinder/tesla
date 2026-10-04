@@ -144,3 +144,27 @@ def test_car_status_without_tokens_exits_2(config_dir):
     result = invoke(config_dir, "car", "status")
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
+
+
+def test_auto_charge_without_vin_exits_2(config_dir):
+    result = invoke(config_dir, "auto-charge", "--once")
+    assert result.exit_code == 2
+    assert "VIN" in combined(result)
+
+
+def test_auto_charge_without_site_id_exits_2(config_dir):
+    assert invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code == 0
+    result = invoke(config_dir, "auto-charge", "--once")
+    assert result.exit_code == 2
+    assert "energy_site_id" in combined(result)
+
+
+def test_auto_charge_without_tokens_exits_2(config_dir):
+    assert invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code == 0
+    assert (
+        invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123").exit_code
+        == 0
+    )
+    result = invoke(config_dir, "auto-charge", "--once")
+    assert result.exit_code == 2
+    assert "tesla auth login" in combined(result)
