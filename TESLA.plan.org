@@ -40,6 +40,7 @@ BLE, scheduling, multiple vehicles/sites, notifications, web UI.
 | Poll interval     | 300 s default, configurable                                                                                                                                                                            |
 | Backoff           | 5 s initial, x2, cap 300 s, +/-20% jitter, give up after 5 consecutive failures                                                                                                                        |
 | Distribution name | =tesla= (project, module, executable); user decision in M1 --- no rename to =tesla-cli=                                                                                                                  |
+| Notifications     | ntfy.sh (self-hosted URL supported); topic/token from env/.env; event-driven with persisted cooldowns                                                                                                     |
 | Error handling    | Catch =TeslaFleetError= explicitly --- it subclasses =BaseException=, not =Exception=                                                                                                                        |
 
 * Tesla developer app (one-time setup)
@@ -226,6 +227,15 @@ require_plugged = true
 wake_timeout_seconds = 90
 set_charge_limit = 0          # 0 = leave unchanged
 max_runtime_hours = 0         # 0 = unlimited
+
+[notify]
+enabled = false
+url = "https://ntfy.sh"       # or a self-hosted server
+priority = 3                  # default 1-5
+tags = "tesla"                # comma-separated emoji shortcodes allowed
+min_priority = 1              # drop stages below this priority
+verbose = false               # true = ignore cooldowns (observation mode)
+# TESLA_NTFY_TOPIC / TESLA_NTFY_TOKEN / TESLA_NTFY_URL come from env or .env
 #+end_src
 
 =~/.config/tesla/tokens.json= (mode 0600):
@@ -253,6 +263,8 @@ max_runtime_hours = 0         # 0 = unlimited
 | =tesla auth status=                      | Token validity, refreshes if needed, persists rotation |
 | =tesla auth logout=                      | Delete local token (no server-side revoke)             |
 | =tesla products=                         | List vehicles and energy sites with VIN/site IDs       |
+| =tesla notify test=                      | Send a test notification via ntfy                      |
+| =tesla notify reset=                     | Clear notification cooldown state                      |
 | =tesla powerwall status [--watch]=       | =percentage_charged=, reserve, grid status               |
 | =tesla car status=                       | Battery %, charging state, plugged, charge limit       |
 | =tesla car charge start / stop=          | Manual charging commands                               |
@@ -535,11 +547,33 @@ live manual command.
 
 /See:/ [[*CLI surface (v0.1)]], [[*Deployment]], [[*Testing]], [[*Risks and open items]].
 
+** TODO M7 --- Notifications (ntfy)
+=notify.py= with =NtfyNotifier= (JSON publish, bearer token, best-effort),
+=NotifyState= for persisted per-stage cooldowns, and =build_notifier()=.
+Stages: started (12 h), threshold (6 h), wait_plug (2 h), charging,
+already_charging (24 h), trigger_failed, poll_failed (1 h), gave_up,
+auth_failed, max_runtime, stopped, manual. CLI =notify test=;
+=auto-charge= passes the notifier through; =car charge start|stop|limit=
+notify too; =doctor= reports topic presence. Dry-run sends nothing.
+/Done when:/ a real =tesla notify test= and an auto-charge run with a
+configured topic deliver the expected stages without exceeding ntfy
+limits.
+
+/Actual:/ Implemented; 132 tests, ruff clean. Tuning: =notify.min_priority=
+drops stages below a priority level and =notify.verbose= ignores all
+cooldowns for observation. iOS cannot filter by priority or pause
+subscriptions (Android gets per-priority channels), so tuning is
+server-side; tags provide the visual classification. Pending: live test
+with a real TESLA_NTFY_TOPIC (user has not set one yet), and a
+notify-enabled auto-charge dry-run/real run.
+
+/See:/ [[*Configuration and tokens]], [[*Core flow: auto-charge]], [[*CLI surface (v0.1)]].
+
 * Backlog (post-v0.1)
 - Telemetry streaming (=fleet_telemetry_config=) instead of polling.
 - Local control: BLE for the car, =aiopowerwall=/TEDAPI for the gateway.
 - Multiple vehicles/sites with per-entity config.
-- Notifications (ntfy, Home Assistant, email) on trigger/failure.
+- Notifications: Home Assistant, e-mail (ntfy delivered in M7).
 - Hysteresis: stop charging when the Powerwall drops below a floor.
 - =--json= output on status commands for scripting.
 - Tariff-aware windows using =get_tariff_periods()=.

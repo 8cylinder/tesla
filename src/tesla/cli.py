@@ -37,6 +37,7 @@ from .client import (
     Credentials,
     build_vehicle,
     ensure_fresh_token,
+    env_value,
     exchange_code,
     fetch_hosted_key,
     generate_key,
@@ -56,11 +57,13 @@ from .config import (
     key_path,
     load_config,
     lock_path,
+    notify_state_path,
     save_config,
     set_dotted,
     tokens_path,
 )
 from .logging import setup_logging
+from .notify import NotifyError, build_notifier
 from .powerwall import backup_reserve, grid_status, percentage_charged
 from .tokens import TokenError, Tokens, load_tokens
 
@@ -209,7 +212,7 @@ def _render_products(data: dict) -> None:
         console.print("No products found.")
 
 
-@click.group()
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="tesla")
 @click.option("-v", "--verbose", count=True, help="Increase log verbosity (-v, -vv).")
 @click.option(
@@ -280,6 +283,44 @@ def auth_logout() -> None:
     console.print(
         f"[green]Removed[/green] {path}. Run 'tesla auth login' to authorize again."
     )
+
+
+@cli.group()
+def notify() -> None:
+    """Configure and test ntfy notifications."""
+
+
+@notify.command("test")
+@click.option("--message", default="test notification from the tesla CLI")
+def notify_test(message: str) -> None:
+    """Send a test notification using the configured ntfy topic."""
+    with _api_errors():
+        config = load_config()
+        if not config.notify.enabled:
+            _fail(
+                "notifications are disabled; run 'tesla config set notify.enabled true'"
+            )
+        try:
+            notifier = build_notifier(config)
+        except NotifyError as exc:
+            _fail(str(exc))
+        if notifier is None:  # pragma: no cover - enabled checked above
+            _fail("notifications are disabled")
+        ok = asyncio.run(notifier.send("test", message, title="tesla notify test"))
+    if not ok:
+        _fail("failed to send; check the URL/topic and logs", 3)
+    console.print("[green]notification sent[/green]")
+
+
+@notify.command("reset")
+def notify_reset() -> None:
+    """Clear notification cooldown state so stages notify again."""
+    path = notify_state_path()
+    if path.exists():
+        path.unlink()
+        console.print(f"[green]Cleared[/green] {path}")
+    else:
+        console.print("No notification state to clear.")
 
 
 @cli.command()
@@ -429,7 +470,17 @@ def _car_context() -> tuple[Config, Credentials, Tokens]:
     return config, credentials, stored
 
 
-async def _car_action(config, credentials, stored, action):
+async def _send_manual_notification(config: Config, message: str) -> None:
+    try:
+        notifier = build_notifier(config)
+    except NotifyError as exc:
+        err_console.print(f"[yellow]notify:[/yellow] {exc}")
+        return
+    if notifier is not None:
+        await notifier.send("manual", message, priority=3, tags=("wrench",))
+
+
+async def _car_action(config, credentials, stored, action, *, notify_message):
     """Wake the vehicle, run one command on it, and return the response."""
     async with oauth_client(
         credentials=credentials, config=config, stored=stored
@@ -439,7 +490,9 @@ async def _car_action(config, credentials, stored, action):
         await vehicle.wake_up(
             wait=True, timeout=config.auto_charge.wake_timeout_seconds
         )
-        return await action(vehicle)
+        result = await action(vehicle)
+    await _send_manual_notification(config, notify_message)
+    return result
 
 
 @car.group("charge")
@@ -453,7 +506,13 @@ def car_charge_start() -> None:
     with _api_errors():
         config, credentials, stored = _car_context()
         result = asyncio.run(
-            _car_action(config, credentials, stored, lambda v: v.charge_start())
+            _car_action(
+                config,
+                credentials,
+                stored,
+                lambda v: v.charge_start(),
+                notify_message="manual charge_start sent",
+            )
         )
     console.print("[green]charge_start sent[/green]")
     if result:
@@ -466,7 +525,13 @@ def car_charge_stop() -> None:
     with _api_errors():
         config, credentials, stored = _car_context()
         result = asyncio.run(
-            _car_action(config, credentials, stored, lambda v: v.charge_stop())
+            _car_action(
+                config,
+                credentials,
+                stored,
+                lambda v: v.charge_stop(),
+                notify_message="manual charge_stop sent",
+            )
         )
     console.print("[green]charge_stop sent[/green]")
     if result:
@@ -481,7 +546,11 @@ def car_charge_limit(percent: int) -> None:
         config, credentials, stored = _car_context()
         result = asyncio.run(
             _car_action(
-                config, credentials, stored, lambda v: v.set_charge_limit(percent)
+                config,
+                credentials,
+                stored,
+                lambda v: v.set_charge_limit(percent),
+                notify_message=f"manual charge limit set to {percent}%",
             )
         )
     console.print(f"[green]set_charge_limit {percent}% sent[/green]")
@@ -532,6 +601,17 @@ def doctor() -> None:
         if config.vehicle.command_mode == "signed":
             path = key_path(config)
             rows.append(("private key", path.exists(), str(path)))
+        if config.notify.enabled:
+            topic = env_value("TESLA_NTFY_TOPIC")
+            rows.append(
+                (
+                    "notify",
+                    bool(topic),
+                    "topic set" if topic else "TESLA_NTFY_TOPIC not set",
+                )
+            )
+        else:
+            rows.append(("notify", True, "disabled"))
 
     api_failed = False
     if config is not None and credentials is not None and stored is not None:
@@ -622,6 +702,10 @@ def auto_charge(
         stored = load_tokens()
         if stored is None:
             _fail("not logged in; run 'tesla auth login'")
+        try:
+            notifier = build_notifier(config)
+        except NotifyError as exc:
+            _fail(str(exc))
 
         lock = LockFile(lock_path())
         try:
@@ -635,7 +719,9 @@ def auto_charge(
             ) as oauth:
                 client = TeslaAutoChargeClient(oauth, config)
                 await client.build()
-                return await run_auto_charge(client, config, dry_run=dry_run, once=once)
+                return await run_auto_charge(
+                    client, config, dry_run=dry_run, once=once, notifier=notifier
+                )
 
         try:
             code = asyncio.run(run())

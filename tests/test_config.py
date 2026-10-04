@@ -124,3 +124,38 @@ def test_set_dotted_validation():
 
 def test_get_dotted():
     assert get_dotted(Config(), "auto_charge.poll_interval_seconds") == 300
+
+
+def test_notify_defaults_and_set():
+    config = Config()
+    assert config.notify.enabled is False
+    assert config.notify.url == "https://ntfy.sh"
+    assert config.notify.priority == 3
+    assert config.notify.min_priority == 1
+    assert config.notify.verbose is False
+    set_dotted(config, "notify.enabled", "true")
+    set_dotted(config, "notify.priority", "5")
+    set_dotted(config, "notify.tags", "tesla,powerwall")
+    set_dotted(config, "notify.min_priority", "4")
+    set_dotted(config, "notify.verbose", "true")
+    assert config.notify.enabled is True
+    assert config.notify.priority == 5
+    assert config.notify.tags == "tesla,powerwall"
+    assert config.notify.min_priority == 4
+    assert config.notify.verbose is True
+
+
+def test_notify_priority_validation():
+    with pytest.raises(ConfigError, match="notify.priority"):
+        set_dotted(Config(), "notify.priority", "9")
+    with pytest.raises(ConfigError, match="notify.min_priority"):
+        set_dotted(Config(), "notify.min_priority", "0")
+
+
+def test_notify_round_trip(config_dir):
+    config = Config()
+    config.notify.enabled = True
+    config.notify.url = "https://ntfy.example"
+    config.notify.tags = "tesla,powerwall"
+    save_config(config)
+    assert load_config().notify == config.notify

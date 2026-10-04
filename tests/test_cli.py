@@ -25,6 +25,18 @@ def test_version(config_dir):
     assert __version__ in result.output
 
 
+def test_help_short_flag(config_dir):
+    result = invoke(config_dir, "-h")
+    assert result.exit_code == 0
+    assert "Usage:" in result.output
+
+
+def test_subcommand_help_short_flag(config_dir):
+    result = invoke(config_dir, "config", "-h")
+    assert result.exit_code == 0
+    assert "Usage:" in result.output
+
+
 def test_config_show_defaults(config_dir):
     result = invoke(config_dir, "config", "show")
     assert result.exit_code == 0
@@ -205,3 +217,46 @@ def test_doctor_missing_credentials_exits_2(config_dir, tmp_path, monkeypatch):
     output = combined(result)
     assert "credentials" in output
     assert "tokens" in output
+
+
+def test_notify_test_disabled_exits_2(config_dir):
+    result = invoke(config_dir, "notify", "test")
+    assert result.exit_code == 2
+    assert "disabled" in combined(result)
+
+
+def test_notify_test_missing_topic_exits_2(config_dir, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code == 0
+    monkeypatch.delenv("TESLA_NTFY_TOPIC", raising=False)
+    result = invoke(config_dir, "notify", "test")
+    assert result.exit_code == 2
+    assert "TESLA_NTFY_TOPIC" in combined(result)
+
+
+def test_notify_test_sends(config_dir, monkeypatch):
+    class FakeNotifier:
+        def __init__(self):
+            self.stages = []
+
+        async def send(self, stage, message, **kwargs):
+            self.stages.append(stage)
+            return True
+
+    notifier = FakeNotifier()
+    monkeypatch.setattr("tesla.cli.build_notifier", lambda config: notifier)
+    assert invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code == 0
+    result = invoke(config_dir, "notify", "test")
+    assert result.exit_code == 0
+    assert notifier.stages == ["test"]
+
+
+def test_notify_reset_clears_state(config_dir):
+    path = config_dir / "notify_state.json"
+    path.write_text('{"threshold": 1.0}')
+    result = invoke(config_dir, "notify", "reset")
+    assert result.exit_code == 0
+    assert not path.exists()
+    result = invoke(config_dir, "notify", "reset")
+    assert result.exit_code == 0
+    assert "No notification state to clear" in result.output
