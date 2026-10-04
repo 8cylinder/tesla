@@ -116,3 +116,31 @@ def test_key_status_without_key_exits_2(config_dir, tmp_path, monkeypatch):
     )
     assert result.exit_code == 2
     assert "key generate" in combined(result)
+
+
+def test_powerwall_status_without_site_id_exits_2(config_dir):
+    result = invoke(config_dir, "powerwall", "status")
+    assert result.exit_code == 2
+    assert "energy_site_id" in combined(result)
+
+
+def test_powerwall_status_without_tokens_exits_2(config_dir):
+    result = invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123")
+    assert result.exit_code == 0
+    result = invoke(config_dir, "powerwall", "status")
+    assert result.exit_code == 2
+    assert "tesla auth login" in combined(result)
+
+
+def test_car_status_without_vin_exits_2(config_dir):
+    result = invoke(config_dir, "car", "status")
+    assert result.exit_code == 2
+    assert "VIN" in combined(result)
+
+
+def test_car_status_without_tokens_exits_2(config_dir):
+    result = invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST")
+    assert result.exit_code == 0
+    result = invoke(config_dir, "car", "status")
+    assert result.exit_code == 2
+    assert "tesla auth login" in combined(result)

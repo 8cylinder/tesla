@@ -22,6 +22,7 @@ from tesla_fleet_api.exceptions import (
 )
 
 from . import __version__
+from .car import charge_state, is_plugged
 from .client import (
     HOSTED_KEY_PATH,
     SCOPES,
@@ -42,6 +43,7 @@ from .client import (
 )
 from .config import ConfigError, dump_toml, load_config, save_config, set_dotted
 from .logging import setup_logging
+from .powerwall import backup_reserve, grid_status, percentage_charged
 from .tokens import TokenError, Tokens, load_tokens
 
 console = Console()
@@ -267,6 +269,122 @@ def products() -> None:
 
         data = asyncio.run(run())
     _render_products(data)
+
+
+def _render_powerwall(live: dict, info: dict | None = None) -> None:
+    pct = percentage_charged(live)
+    reserve = backup_reserve(info or {})
+    if reserve is None:
+        reserve = backup_reserve(live)
+    grid = grid_status(live)
+    table = Table(title="Powerwall")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Battery", f"{pct:.1f}%" if pct is not None else "unavailable")
+    table.add_row(
+        "Backup reserve", f"{reserve:.0f}%" if reserve is not None else "unavailable"
+    )
+    table.add_row("Grid status", grid or "unavailable")
+    console.print(table)
+
+
+@cli.group()
+def powerwall() -> None:
+    """Powerwall status."""
+
+
+@powerwall.command("status")
+@click.option("--watch", is_flag=True, help="Poll until interrupted.")
+@click.option(
+    "--interval",
+    type=click.IntRange(min=5),
+    default=30,
+    show_default=True,
+    help="Seconds between polls with --watch.",
+)
+def powerwall_status(watch: bool, interval: int) -> None:
+    """Show battery percentage, reserve, and grid status."""
+    with _api_errors():
+        config = load_config()
+        site_id = config.powerwall.energy_site_id
+        if site_id is None:
+            _fail(
+                "no energy_site_id set; run "
+                "'tesla config set powerwall.energy_site_id <id>'"
+            )
+        credentials = load_credentials()
+        stored = load_tokens()
+        if stored is None:
+            _fail("not logged in; run 'tesla auth login'")
+
+        async def run() -> None:
+            async with oauth_client(
+                credentials=credentials, config=config, stored=stored
+            ) as oauth:
+                site = oauth.energySites.create(site_id)
+                while True:
+                    await ensure_fresh_token(oauth)
+                    _render_powerwall(await site.live_status(), await site.site_info())
+                    if not watch:
+                        return
+                    await asyncio.sleep(interval)
+
+        try:
+            asyncio.run(run())
+        except KeyboardInterrupt:
+            console.print("stopped")
+
+
+def _render_car(data: dict) -> None:
+    state = charge_state(data)
+    if state is None:
+        _fail("vehicle did not return charge state (asleep or offline?)", 3)
+    table = Table(title="Vehicle")
+    table.add_column("Field")
+    table.add_column("Value")
+    battery = state.get("battery_level")
+    table.add_row("Battery", f"{battery}%" if battery is not None else "unavailable")
+    range_value = state.get("battery_range")
+    table.add_row(
+        "Range", f"{range_value} mi" if range_value is not None else "unavailable"
+    )
+    table.add_row("Charging state", str(state.get("charging_state", "unknown")))
+    plugged = is_plugged(data)
+    plugged_text = {None: "unknown", True: "yes", False: "no"}[plugged]
+    table.add_row("Plugged in", plugged_text)
+    limit = state.get("charge_limit_soc")
+    table.add_row("Charge limit", f"{limit}%" if limit is not None else "unavailable")
+    console.print(table)
+
+
+@cli.group()
+def car() -> None:
+    """Vehicle status and charging commands."""
+
+
+@car.command("status")
+def car_status() -> None:
+    """Show battery, charging state, plug status, and charge limit."""
+    with _api_errors():
+        config = load_config()
+        vin = config.vehicle.vin
+        if not vin:
+            _fail("no VIN set; run 'tesla config set vehicle.vin <vin>'")
+        credentials = load_credentials()
+        stored = load_tokens()
+        if stored is None:
+            _fail("not logged in; run 'tesla auth login'")
+
+        async def run() -> dict:
+            async with oauth_client(
+                credentials=credentials, config=config, stored=stored
+            ) as oauth:
+                await ensure_fresh_token(oauth)
+                vehicle = oauth.vehicles.createFleet(vin)
+                return await vehicle.vehicle_data(endpoints=["charge_state"])
+
+        data = asyncio.run(run())
+    _render_car(data)
 
 
 def _match_status(local_point: str, other: str | None) -> str:
