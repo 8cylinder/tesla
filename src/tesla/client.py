@@ -14,7 +14,7 @@ import aiohttp
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from dotenv import dotenv_values
-from tesla_fleet_api import TeslaFleetOAuth
+from tesla_fleet_api import TeslaFleetApi, TeslaFleetOAuth
 from tesla_fleet_api.const import Scope
 from tesla_fleet_api.exceptions import TeslaFleetError
 
@@ -122,6 +122,27 @@ def load_credentials(
     return Credentials(resolved_id, resolved_secret, resolved_redirect)
 
 
+def _fix_empty_json(oauth: TeslaFleetOAuth) -> None:
+    """Make bodyless POSTs carry a JSON Content-Type.
+
+    TeslaFleetOAuth._request defaults json=None while the base class
+    defaults to {}, so wake_up() and unsigned commands send no
+    Content-Type and Tesla rejects them ("The HTTP request does not have
+    a Content-Type header set to application/json"). Route requests
+    through the base implementation with an explicit empty body; aiohttp
+    then sets the header. Remove once upstream fixes the default.
+    """
+    base_request = TeslaFleetApi._request
+
+    async def request(method, path, params=None, json=None):
+        await oauth.check_access_token()
+        return await base_request(
+            oauth, method, path, params, {} if json is None else json
+        )
+
+    oauth._request = request
+
+
 def build_oauth(
     session: aiohttp.ClientSession,
     credentials: Credentials,
@@ -129,7 +150,7 @@ def build_oauth(
     stored: Tokens | None = None,
 ) -> TeslaFleetOAuth:
     """Create a TeslaFleetOAuth bound to stored tokens when available."""
-    return TeslaFleetOAuth(
+    oauth = TeslaFleetOAuth(
         session,
         region=config.region,
         client_id=credentials.client_id,
@@ -138,6 +159,8 @@ def build_oauth(
         refresh_token=stored.refresh_token if stored else None,
         expires=stored.expires if stored else 0,
     )
+    _fix_empty_json(oauth)
+    return oauth
 
 
 @asynccontextmanager
