@@ -133,16 +133,19 @@ def test_notify_defaults_and_set():
     assert config.notify.priority == 3
     assert config.notify.min_priority == 1
     assert config.notify.verbose is False
+    assert config.notify.on_start is True
     set_dotted(config, "notify.enabled", "true")
     set_dotted(config, "notify.priority", "5")
     set_dotted(config, "notify.tags", "tesla,powerwall")
     set_dotted(config, "notify.min_priority", "4")
     set_dotted(config, "notify.verbose", "true")
+    set_dotted(config, "notify.on_start", "false")
     assert config.notify.enabled is True
     assert config.notify.priority == 5
     assert config.notify.tags == "tesla,powerwall"
     assert config.notify.min_priority == 4
     assert config.notify.verbose is True
+    assert config.notify.on_start is False
 
 
 def test_notify_priority_validation():

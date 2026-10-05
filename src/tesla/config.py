@@ -75,6 +75,7 @@ class NotifyConfig:
     tags: str = "tesla"
     min_priority: int = 1
     verbose: bool = False
+    on_start: bool = True
 
 
 @dataclass
@@ -120,6 +121,7 @@ _SCHEMA: dict[str, Any] = {
         "tags": str,
         "min_priority": int,
         "verbose": bool,
+        "on_start": bool,
     },
 }
 
@@ -300,6 +302,7 @@ def dump_toml(config: Config) -> str:
         f"tags = {_toml(config.notify.tags)}",
         f"min_priority = {_toml(config.notify.min_priority)}",
         f"verbose = {_toml(config.notify.verbose)}",
+        f"on_start = {_toml(config.notify.on_start)}",
     ]
     return "\n".join(lines) + "\n"
 

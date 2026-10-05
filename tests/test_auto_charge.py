@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import time
 
 import pytest
 from tesla_fleet_api.exceptions import (
@@ -221,50 +222,108 @@ async def test_run_sigint_exits_cleanly(config_dir):
 class FakeNotifier:
     def __init__(self):
         self.calls = []
-        self.reset_calls = []
+        self.on_changes = []
+        self.cooldowns = []
+        self.situations = []
+        self.situation = None
+        self.last_run_value = None
+        self.touch_calls = 0
 
     async def send(self, stage, message, **kwargs):
+        on_change = kwargs.get("on_change")
+        if on_change is not None and self.situation == on_change:
+            return False
+        if on_change is not None:
+            self.situation = on_change
         self.calls.append(stage)
+        self.on_changes.append(on_change)
+        self.cooldowns.append(kwargs.get("cooldown"))
         return True
 
-    def reset(self, *stages):
-        self.reset_calls.append(stages)
+    def note_situation(self, value):
+        self.situation = value
+        self.situations.append(value)
+
+    def last_run(self):
+        return self.last_run_value
+
+    def touch(self):
+        self.touch_calls += 1
+        self.last_run_value = time.time()
 
 
-async def test_watch_notifies_started_threshold_charging(config_dir):
+async def test_watch_notifies_charging(config_dir):
     notifier = FakeNotifier()
     client = FakeClient(pcts=[100.0], states=["Stopped"])
     assert await watch(client, load_config(), notifier=notifier) == 0
-    assert notifier.calls == ["started", "threshold", "charging"]
-    assert ("threshold", "wait_plug", "already_charging") in notifier.reset_calls
+    assert notifier.calls == ["on_start", "charging"]
+    assert notifier.situations == ["already_charging"]
 
 
-async def test_watch_notifies_wait_plug(config_dir):
+async def test_watch_startup_report_replaces_wait_plug(config_dir):
     notifier = FakeNotifier()
     client = FakeClient(pcts=[100.0], states=["Disconnected"])
     assert await watch(client, load_config(), once=True, notifier=notifier) == 0
-    assert notifier.calls == ["started", "threshold", "wait_plug"]
+    assert notifier.calls == ["on_start"]
+    assert notifier.situations == ["wait_plug"]
+
+
+async def test_watch_condition_uses_on_change_when_recent(config_dir):
+    notifier = FakeNotifier()
+    notifier.last_run_value = time.time()
+    client = FakeClient(pcts=[100.0], states=["Disconnected"])
+    assert await watch(client, load_config(), once=True, notifier=notifier) == 0
+    assert notifier.calls == ["wait_plug"]
+    assert notifier.on_changes == ["wait_plug"]
+
+
+async def test_watch_startup_report_after_gap(config_dir):
+    notifier = FakeNotifier()
+    notifier.last_run_value = time.time() - 3600
+    client = FakeClient(pcts=[42.0])
+    assert await watch(client, load_config(), once=True, notifier=notifier) == 0
+    assert notifier.calls == ["on_start"]
+
+
+async def test_watch_startup_report_disabled(config_dir):
+    config = load_config()
+    config.notify.on_start = False
+    notifier = FakeNotifier()
+    notifier.last_run_value = time.time()
+    client = FakeClient(pcts=[100.0], states=["Disconnected"])
+    assert await watch(client, config, once=True, notifier=notifier) == 0
+    assert notifier.calls == ["wait_plug"]
 
 
 async def test_watch_notifies_already_charging(config_dir):
     notifier = FakeNotifier()
     client = FakeClient(pcts=[100.0], states=["Charging"])
     assert await watch(client, load_config(), once=True, notifier=notifier) == 0
-    assert notifier.calls == ["started", "threshold", "already_charging"]
+    assert notifier.calls == ["on_start"]
+    assert notifier.situations == ["already_charging"]
 
 
 async def test_watch_notifies_wait_plug_when_asleep(config_dir):
     notifier = FakeNotifier()
     client = FakeClient(pcts=[100.0], states=[VehicleOffline()])
     assert await watch(client, load_config(), once=True, notifier=notifier) == 0
-    assert notifier.calls == ["started", "threshold", "wait_plug"]
+    assert notifier.calls == ["on_start"]
+    assert notifier.situations == ["wait_plug"]
 
 
 async def test_watch_notifies_wait_plug_when_state_unknown(config_dir):
     notifier = FakeNotifier()
     client = FakeClient(pcts=[100.0], states=[None])
     assert await watch(client, load_config(), once=True, notifier=notifier) == 0
-    assert notifier.calls == ["started", "threshold", "wait_plug"]
+    assert notifier.calls == ["on_start"]
+
+
+async def test_watch_below_threshold_notes_situation(config_dir):
+    notifier = FakeNotifier()
+    client = FakeClient(pcts=[42.0])
+    assert await watch(client, load_config(), once=True, notifier=notifier) == 0
+    assert notifier.calls == ["on_start"]
+    assert notifier.situations == ["below_threshold"]
 
 
 async def test_watch_dry_run_sends_no_notifications(config_dir):
@@ -272,6 +331,8 @@ async def test_watch_dry_run_sends_no_notifications(config_dir):
     client = FakeClient(pcts=[100.0], states=["Stopped"])
     assert await watch(client, load_config(), dry_run=True, notifier=notifier) == 0
     assert notifier.calls == []
+    assert notifier.situations == []
+    assert notifier.touch_calls == 0
 
 
 async def test_watch_notifies_gave_up(config_dir):
@@ -292,15 +353,14 @@ async def test_watch_notifies_gave_up(config_dir):
         )
         == 3
     )
-    assert "poll_failed" in notifier.calls
-    assert notifier.calls[-1] == "gave_up"
+    assert notifier.calls == ["poll_failed", "gave_up"]
 
 
 async def test_watch_notifies_auth_failure(config_dir):
     notifier = FakeNotifier()
     client = FakeClient(error=InvalidToken())
     assert await watch(client, load_config(), notifier=notifier) == 2
-    assert notifier.calls == ["started", "auth_failed"]
+    assert notifier.calls == ["auth_failed"]
 
 
 async def test_run_sigint_notifies_stopped(config_dir):

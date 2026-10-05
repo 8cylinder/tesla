@@ -36,10 +36,6 @@ BACKOFF_CAP = 300.0
 MAX_FAILURES = 5
 AUTH_ERRORS = (OAuthExpired, InvalidToken, LoginRequired, InvalidScope)
 
-NOTIFY_STARTED_COOLDOWN = 12 * 3600
-NOTIFY_THRESHOLD_COOLDOWN = 6 * 3600
-NOTIFY_WAIT_PLUG_COOLDOWN = 2 * 3600
-NOTIFY_ALREADY_CHARGING_COOLDOWN = 24 * 3600
 NOTIFY_POLL_FAILED_COOLDOWN = 3600
 
 
@@ -203,6 +199,7 @@ class AutoCharger:
     ) -> None:
         self.client = client
         self.auto = config.auto_charge
+        self.notify = config.notify
         self.dry_run = dry_run
         self.once = once
         self.sleep = sleep
@@ -210,6 +207,7 @@ class AutoCharger:
         self.jitter = jitter
         self.notifier = notifier
         self.failures = 0
+        self._report_due = False
         self.started_at = clock()
 
     async def _notify(
@@ -220,25 +218,79 @@ class AutoCharger:
         priority: int | None = None,
         tags: tuple[str, ...] | list[str] = (),
         cooldown: float | None = None,
+        on_change: str | None = None,
     ) -> None:
         """Best-effort notification; never affects the loop."""
         if self.notifier is None or self.dry_run:
             return
         await self.notifier.send(
-            stage, message, priority=priority, tags=tags, cooldown=cooldown
+            stage,
+            message,
+            priority=priority,
+            tags=tags,
+            cooldown=cooldown,
+            on_change=on_change,
         )
 
-    def _reset_notifications(self, *stages: str) -> None:
-        if self.notifier is not None and hasattr(self.notifier, "reset"):
-            self.notifier.reset(*stages)
+    def _note_situation(self, value: str) -> None:
+        """Record the current situation without sending a notification."""
+        if self.notifier is None or self.dry_run:
+            return
+        if hasattr(self.notifier, "note_situation"):
+            self.notifier.note_situation(value)
+
+    def _startup_report_due(self) -> bool:
+        if self.notifier is None or self.dry_run or not self.notify.on_start:
+            return False
+        if not self.once:
+            return True
+        last = self.notifier.last_run() if hasattr(self.notifier, "last_run") else None
+        if last is None:
+            return True
+        return (time.time() - last) >= 2 * self.auto.poll_interval_seconds
+
+    def _touch(self) -> None:
+        if self.notifier is None or self.dry_run:
+            return
+        if hasattr(self.notifier, "touch"):
+            self.notifier.touch()
+
+    async def _startup_report(self, pct, action, state) -> None:
+        if action is Action.SLEEP:
+            if pct is None:
+                message = "watcher started; Powerwall reading unavailable"
+            else:
+                message = (
+                    f"watcher started; Powerwall at {pct:.1f}% "
+                    f"(threshold {self.auto.threshold}%)"
+                )
+        elif action is Action.WAIT:
+            if state == "Asleep":
+                message = (
+                    "watcher started; vehicle asleep, waiting for plug "
+                    "(require_plugged)"
+                )
+            else:
+                message = "watcher started; charge state unknown, waiting"
+        elif action is Action.WAIT_PLUG:
+            message = "watcher started; waiting for the car to be plugged in"
+        elif action is Action.DONE:
+            message = "watcher started; vehicle already charging or complete"
+        elif pct is None:
+            message = "watcher started; starting charge"
+        else:
+            message = f"watcher started; Powerwall at {pct:.1f}%; starting charge"
+        await self._notify(
+            "on_start", message, priority=2, tags=("information_source",)
+        )
+        if action in (Action.WAIT, Action.WAIT_PLUG):
+            self._note_situation("wait_plug")
+        elif action is Action.DONE:
+            self._note_situation("already_charging")
 
     async def run(self) -> int:
-        await self._notify(
-            "started",
-            "auto-charge watch started",
-            priority=2,
-            cooldown=NOTIFY_STARTED_COOLDOWN,
-        )
+        self._report_due = self._startup_report_due()
+        self._touch()
         while True:
             if self.auto.max_runtime_hours:
                 elapsed = self.clock() - self.started_at
@@ -275,6 +327,7 @@ class AutoCharger:
                 continue
 
             action = decide(pct, self.auto.threshold, None, self.auto.require_plugged)
+            state = None
             if pct is not None and pct >= self.auto.threshold:
                 try:
                     state = await self.client.charging_state()
@@ -300,20 +353,15 @@ class AutoCharger:
                     pct, self.auto.threshold, state, self.auto.require_plugged
                 )
 
-            if pct is not None and pct >= self.auto.threshold:
-                await self._notify(
-                    "threshold",
-                    f"Powerwall at {pct:.1f}% (threshold {self.auto.threshold}%)",
-                    priority=4,
-                    tags=("battery",),
-                    cooldown=NOTIFY_THRESHOLD_COOLDOWN,
-                )
-
             self.failures = 0
+            if self._report_due:
+                await self._startup_report(pct, action, state)
+                self._report_due = False
             if action is Action.SLEEP:
                 LOGGER.info(
                     "Powerwall %s is below threshold %s", pct, self.auto.threshold
                 )
+                self._note_situation("below_threshold")
             elif action is Action.WAIT:
                 if state == "Asleep":
                     LOGGER.info(
@@ -327,7 +375,7 @@ class AutoCharger:
                         "plug (require_plugged)",
                         priority=3,
                         tags=("electric_plug",),
-                        cooldown=NOTIFY_WAIT_PLUG_COOLDOWN,
+                        on_change="wait_plug",
                     )
                 else:
                     LOGGER.info(
@@ -339,7 +387,7 @@ class AutoCharger:
                         "Powerwall at threshold; charge state unknown, waiting",
                         priority=3,
                         tags=("warning",),
-                        cooldown=NOTIFY_WAIT_PLUG_COOLDOWN,
+                        on_change="wait_plug",
                     )
             elif action is Action.WAIT_PLUG:
                 LOGGER.info("Powerwall %s is at threshold; waiting for plug", pct)
@@ -348,7 +396,7 @@ class AutoCharger:
                     "Powerwall at threshold; waiting for the car to be plugged in",
                     priority=3,
                     tags=("electric_plug",),
-                    cooldown=NOTIFY_WAIT_PLUG_COOLDOWN,
+                    on_change="wait_plug",
                 )
             elif action is Action.DONE:
                 LOGGER.info("already charging or complete; nothing to do")
@@ -357,7 +405,7 @@ class AutoCharger:
                     "vehicle already charging or complete; nothing to do",
                     priority=2,
                     tags=("heavy_check_mark",),
-                    cooldown=NOTIFY_ALREADY_CHARGING_COOLDOWN,
+                    on_change="already_charging",
                 )
                 return 0
             else:
@@ -372,9 +420,7 @@ class AutoCharger:
                         priority=4,
                         tags=("zap", "heavy_check_mark"),
                     )
-                    self._reset_notifications(
-                        "threshold", "wait_plug", "already_charging"
-                    )
+                    self._note_situation("already_charging")
                     return 0
                 if result is TriggerResult.WAIT:
                     if self.once:
@@ -461,7 +507,7 @@ class AutoCharger:
                         "vehicle is awake but not plugged in; waiting for plug",
                         priority=3,
                         tags=("electric_plug",),
-                        cooldown=NOTIFY_WAIT_PLUG_COOLDOWN,
+                        on_change="wait_plug",
                     )
                     return TriggerResult.WAIT
             if self.auto.set_charge_limit:
