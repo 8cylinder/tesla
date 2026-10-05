@@ -151,6 +151,7 @@ priority = 3                   # default notification priority (1-5)
 tags = "tesla"                 # comma-separated, emoji shortcodes allowed
 min_priority = 1               # drop stages with a lower priority
 verbose = false                # true = ignore cooldowns (observation mode)
+on_start = true                # report the current state on start/restart
 # The topic and token are credentials and live in the environment:
 #   TESLA_NTFY_TOPIC, TESLA_NTFY_TOKEN (optional), TESLA_NTFY_URL (optional)
 ```
@@ -375,11 +376,10 @@ auto-charge stage and after manual charging commands.
 
 | Stage | When | Priority |
 |---|---|---|
-| started | watch loop begins (12 h cooldown) | 2 |
-| threshold | Powerwall reached the threshold (6 h) | 4 |
-| wait_plug | at threshold but unplugged/asleep with `require_plugged` (2 h) | 3 |
+| on_start | watcher starts/restarts: snapshot of the current Powerwall/situation | 2 |
+| wait_plug | entered "at threshold, waiting": asleep, unplugged with `require_plugged`, or unknown state | 3 |
 | charging | `charge_start` verified `Charging` | 4 |
-| already_charging | vehicle already charging/complete (24 h) | 2 |
+| already_charging | entered "at threshold, already charging/complete" | 2 |
 | trigger_failed / poll_failed | wake, command, verification, or poll error | 4 / 3 |
 | gave_up | 5 consecutive failures | 5 |
 | auth_failed | token problem; re-run `tesla auth login` | 5 |
@@ -387,22 +387,35 @@ auto-charge stage and after manual charging commands.
 | stopped | SIGINT/SIGTERM in resident mode | 3 |
 | manual | after `car charge start` / `stop` / `limit` | 3 |
 
-Repeated conditions are suppressed using
-`~/.config/tesla/notify_state.json`, so the 5-minute systemd timer stays
-far below ntfy.sh's 250 messages/day. A verified charge start clears the
-condition cooldowns so the next day notifies fresh. `--dry-run` sends
-nothing, and a failed publish is logged and ignored — it never affects
-the watch loop.
+`on_start` sends one snapshot when the watcher starts, so you always know
+the current state: on every process start for the resident loop, and for
+`--once` timer runs when there is no prior run or the gap since the last
+run exceeded two poll intervals (i.e. after a reboot, sleep, or service
+stop — not on every 5-minute tick). The situation it reports also
+suppresses the immediate duplicate condition message.
+
+Condition notifications (wait_plug, charging, already_charging) are sent
+only when the situation **changes**. Below-threshold polls silently
+update the remembered situation, so the next threshold crossing notifies
+again. The situation and last-run time are persisted in
+`~/.config/tesla/notify_state.json`, so it works the same for the
+resident loop and for per-run systemd timer invocations — no repeated
+pushes while nothing changes. Failure and lifecycle stages are events and
+are sent whenever they happen. `--dry-run` sends nothing and does not
+change the remembered situation. A failed publish is logged and ignored;
+it never affects the watch loop.
 
 ### Tuning what you get
 
 - `notify.min_priority` drops lower-value stages. For example,
   `tesla config set notify.min_priority 4` leaves only threshold,
   charging, trigger_failed, max_runtime, and the priority-5 failures.
-- `notify.verbose true` ignores all cooldowns so every stage is sent
-  every run — handy while learning what the service does. Turn it back
-  off for normal operation. `tesla notify reset` clears the saved
-  cooldown state (useful to re-see a stage immediately).
+- `notify.verbose true` ignores both the situation-change check and the
+  cooldowns, so every stage is sent every run — handy while learning
+  what the service does. Turn it back off for normal operation.
+  `tesla notify reset` clears the remembered situation and cooldowns
+  (useful to re-see a stage immediately, or to force the `on_start`
+  snapshot on the next run).
 - `notify.tags` and the per-stage tags render as emoji/text prefixes and
   are the easiest visual classifier (`battery`, `electric_plug`, `zap`,
   `warning`, `rotating_light`).
@@ -414,13 +427,25 @@ rather than in the app; Android users additionally get per-priority
 notification channels they can customize.
 
 Verbose mode on a 5-minute timer would exceed ntfy.sh's 250 messages/day
-— use manual `--once` runs while observing, or temporarily lengthen
-`OnUnitActiveSec`.
+(normal mode only sends when something changes) — use manual `--once`
+runs while observing, or temporarily lengthen `OnUnitActiveSec`.
 
 ## Troubleshooting
 
 - `412 Precondition Failed` on `products`: the app has not completed
   partner registration — do step 4.
+- `charge trigger failed: ... Content-Type ... application/json`: a
+  known tesla-fleet-api issue where bodyless POSTs (`wake_up`, unsigned
+  commands) omit the JSON Content-Type; this CLI patches it in
+  `client.py` (`_fix_empty_json`). Remove the patch when upstream fixes
+  the default.
+- `charge_start was sent but the vehicle is not charging`: the CLI waits
+  about 60 s (six reads, 10 s apart) before giving up and logs the state
+  it last saw. Common causes: Tesla's **Charge on Solar** is enabled (it
+  owns charging while waiting for solar), a scheduled/departure-time
+  charge is set, or the battery is already at its charge limit. Turn off
+  Charge on Solar if you want this CLI to command charging
+  unconditionally.
 - `Tesla did not return a refresh token` or other auth errors: re-run
   `tesla auth login`; authorization codes expire quickly.
 - `tokens.json is mode 0644`: the CLI refuses to read a token file with

@@ -235,6 +235,7 @@ priority = 3                  # default 1-5
 tags = "tesla"                # comma-separated emoji shortcodes allowed
 min_priority = 1              # drop stages below this priority
 verbose = false               # true = ignore cooldowns (observation mode)
+on_start = true               # report current state on start/restart
 # TESLA_NTFY_TOPIC / TESLA_NTFY_TOKEN / TESLA_NTFY_URL come from env or .env
 #+end_src
 
@@ -542,30 +543,41 @@ build, create the Tesla app (settings table), host the public key,
 configure, authorize, deploy to a home server with a systemd timer
 (cron and resident-service alternatives), plus command reference,
 auto-charge semantics, and troubleshooting. 108 tests, ruff clean.
-Pending: the live end-to-end trigger (needs the car plugged in) and a
-live manual command.
+The first live trigger surfaced the tesla-fleet-api empty-POST
+Content-Type bug (wake_up and unsigned commands); patched in
+=client.py::_fix_empty_json=, see Risks. Charging verification now waits
+~60 s (six reads, 10 s apart) and reports the last observed state;
+=trigger_failed= notifications are rate-limited to hourly. Pending: a
+successful live end-to-end trigger and a live manual command.
 
 /See:/ [[*CLI surface (v0.1)]], [[*Deployment]], [[*Testing]], [[*Risks and open items]].
 
 ** TODO M7 --- Notifications (ntfy)
 =notify.py= with =NtfyNotifier= (JSON publish, bearer token, best-effort),
-=NotifyState= for persisted per-stage cooldowns, and =build_notifier()=.
-Stages: started (12 h), threshold (6 h), wait_plug (2 h), charging,
-already_charging (24 h), trigger_failed, poll_failed (1 h), gave_up,
-auth_failed, max_runtime, stopped, manual. CLI =notify test=;
-=auto-charge= passes the notifier through; =car charge start|stop|limit=
-notify too; =doctor= reports topic presence. Dry-run sends nothing.
+=NotifyState= (persisted situation + event cooldowns), and
+=build_notifier()=. Condition stages fire only on a situation change:
+=wait_plug=, =charging=, =already_charging=; below-threshold polls
+silently record the situation so the next crossing notifies. Events
+always notify: =trigger_failed=, =poll_failed= (1 h cooldown), =gave_up=,
+=auth_failed=, =max_runtime=, =stopped=, =manual=. =on_start= sends a
+current-state snapshot on every resident start and, for =--once= timer
+runs, when the prior run is missing or older than two poll intervals
+(reboot/sleep/service stop), not on every tick. CLI =notify test= /
+=notify reset=; =auto-charge= passes the notifier through;
+=car charge start|stop|limit= notify too; =doctor= reports topic
+presence; =--dry-run= sends nothing and does not change the situation.
 /Done when:/ a real =tesla notify test= and an auto-charge run with a
 configured topic deliver the expected stages without exceeding ntfy
 limits.
 
-/Actual:/ Implemented; 132 tests, ruff clean. Tuning: =notify.min_priority=
-drops stages below a priority level and =notify.verbose= ignores all
-cooldowns for observation. iOS cannot filter by priority or pause
-subscriptions (Android gets per-priority channels), so tuning is
-server-side; tags provide the visual classification. Pending: live test
-with a real TESLA_NTFY_TOPIC (user has not set one yet), and a
-notify-enabled auto-charge dry-run/real run.
+/Actual:/ Implemented; 145 tests, ruff clean. Tuning: =notify.min_priority=
+drops stages below a priority level and =notify.verbose= ignores the
+situation check and cooldowns for observation; =notify.on_start= can be
+disabled. iOS cannot filter by priority or pause subscriptions (Android
+gets per-priority channels), so tuning is server-side; tags provide the
+visual classification. Pending: live test with a real TESLA_NTFY_TOPIC
+(user has not set one yet), and a notify-enabled auto-charge
+dry-run/real run.
 
 /See:/ [[*Configuration and tokens]], [[*Core flow: auto-charge]], [[*CLI surface (v0.1)]].
 
@@ -598,6 +610,13 @@ notify-enabled auto-charge dry-run/real run.
   =VehicleSigned= signs via the universal-message path and =_command()=
   auto-handshakes, so no explicit handshake call is needed --- confirm on
   the first live command in M6.
+- *Empty-POST Content-Type bug.* =TeslaFleetOAuth._request= defaults
+  =json=None= while the base class defaults ={}=, so bodyless POSTs
+  (=wake_up()=, unsigned =charge_start()=/=charge_stop()=) go out without
+  =Content-Type: application/json= and Tesla rejects them ("The HTTP
+  request does not have a Content-Type header set to application/json").
+  =build_oauth()= wraps the request so =None= becomes ={}=; 1.17.2 is
+  the latest release, so drop the workaround once upstream fixes it.
 - *Unsigned command longevity.* Tesla is steering integrations toward
   signed commands / Fleet Telemetry; =fleet= mode may be deprecated
   eventually. Keep the transport toggle thin so a switch is cheap.
