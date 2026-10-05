@@ -1,7 +1,10 @@
+import json
+import time
+
 import aiohttp
 import pytest
 
-from tesla.config import Config, load_config
+from tesla.config import Config
 from tesla.notify import NotifyError, NotifyState, NtfyNotifier, build_notifier
 
 
@@ -51,7 +54,7 @@ def make_config(**notify):
 
 
 def test_build_notifier_disabled():
-    assert build_notifier(load_config(), environ={}) is None
+    assert build_notifier(Config(), environ={}) is None
 
 
 def test_build_notifier_missing_topic(config_dir, tmp_path, monkeypatch):
@@ -120,9 +123,31 @@ async def test_cooldown_suppresses_repeat(config_dir):
     assert await notifier.send("threshold", "one", cooldown=3600)
     assert await notifier.send("threshold", "two", cooldown=3600) is False
     assert total_posts() == 1
-    notifier.reset("threshold")
+    notifier.state.clear("threshold")
     assert await notifier.send("threshold", "three", cooldown=3600)
     assert total_posts() == 2
+
+
+async def test_on_change_suppresses_same_situation(config_dir):
+    def total_posts():
+        return sum(len(session.posts) for session in FakeSession.instances)
+
+    notifier = NtfyNotifier(make_config(enabled=True).notify, "topic")
+    assert await notifier.send("wait_plug", "one", on_change="wait_plug")
+    assert await notifier.send("wait_plug", "two", on_change="wait_plug") is False
+    assert total_posts() == 1
+    notifier.note_situation("below_threshold")
+    assert await notifier.send("wait_plug", "three", on_change="wait_plug")
+    assert total_posts() == 2
+
+
+async def test_verbose_bypasses_situation_and_cooldown(config_dir):
+    config = make_config(enabled=True, verbose=True)
+    notifier = NtfyNotifier(config.notify, "topic")
+    assert await notifier.send("wait_plug", "one", on_change="wait_plug")
+    assert await notifier.send("wait_plug", "two", on_change="wait_plug")
+    assert await notifier.send("threshold", "three", cooldown=3600)
+    assert await notifier.send("threshold", "four", cooldown=3600)
 
 
 async def test_failed_send_does_not_mark(config_dir):
@@ -141,6 +166,16 @@ def test_notify_state_round_trip(config_dir):
     assert state.allow("b", 3600) is True
     state.clear("a")
     assert state.allow("a", 3600) is True
+    state.set_situation("wait_plug")
+    assert state.situation() == "wait_plug"
+
+
+def test_notify_state_reads_legacy_format(config_dir):
+    path = config_dir / "notify_state.json"
+    path.write_text(json.dumps({"threshold": time.time()}))
+    state = NotifyState(path)
+    assert state.allow("threshold", 3600) is False
+    assert state.situation() is None
 
 
 async def test_min_priority_filters_stages(config_dir):
@@ -150,12 +185,3 @@ async def test_min_priority_filters_stages(config_dir):
     assert await notifier.send("charging", "hi", priority=4)
     total = sum(len(session.posts) for session in FakeSession.instances)
     assert total == 1
-
-
-async def test_verbose_bypasses_cooldown(config_dir):
-    config = make_config(enabled=True, verbose=True)
-    notifier = NtfyNotifier(config.notify, "topic")
-    assert await notifier.send("threshold", "one", cooldown=3600)
-    assert await notifier.send("threshold", "two", cooldown=3600)
-    total = sum(len(session.posts) for session in FakeSession.instances)
-    assert total == 2
