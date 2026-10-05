@@ -37,6 +37,7 @@ MAX_FAILURES = 5
 AUTH_ERRORS = (OAuthExpired, InvalidToken, LoginRequired, InvalidScope)
 
 NOTIFY_POLL_FAILED_COOLDOWN = 3600
+NOTIFY_TRIGGER_FAILED_COOLDOWN = 3600
 
 
 class Action(Enum):
@@ -157,16 +158,19 @@ class TeslaAutoChargeClient:
     async def start_charging(self) -> None:
         await self._vehicle.charge_start()
 
-    async def verify_charging(self, attempts: int = 3, delay: float = 5.0) -> bool:
+    async def verify_charging(self, attempts: int = 6, delay: float = 10.0) -> bool:
+        state = None
         for attempt in range(attempts):
             try:
                 state = await self.charging_state()
-            except (TeslaFleetError, aiohttp.ClientError):
+            except (TeslaFleetError, aiohttp.ClientError) as exc:
+                LOGGER.debug("verification read failed: %s", exc)
                 state = None
             if state in ("Charging", "Complete"):
                 return True
             if attempt + 1 < attempts:
                 await asyncio.sleep(delay)
+        LOGGER.warning("charging verification gave up; last state=%r", state)
         return False
 
 
@@ -530,6 +534,7 @@ class AutoCharger:
                     f"charge trigger failed: {exc}",
                     priority=4,
                     tags=("warning",),
+                    cooldown=NOTIFY_TRIGGER_FAILED_COOLDOWN,
                 )
                 raise _ExitCode(3) from exc
             LOGGER.warning("trigger failed: %s", exc)
@@ -538,17 +543,28 @@ class AutoCharger:
                 f"charge trigger failed: {exc}",
                 priority=4,
                 tags=("warning",),
+                cooldown=NOTIFY_TRIGGER_FAILED_COOLDOWN,
             )
             return TriggerResult.RETRY
         if await self.client.verify_charging():
             LOGGER.info("charging started")
             return TriggerResult.STARTED
-        LOGGER.error("charge_start was sent but the vehicle is not charging")
+        state = None
+        try:
+            state = await self.client.charging_state()
+        except (TeslaFleetError, aiohttp.ClientError):
+            state = None
+        detail = f"vehicle reports {state!r}" if state else "state unavailable"
+        LOGGER.error(
+            "charge_start was sent but the vehicle is not charging (%s)", detail
+        )
         await self._notify(
             "trigger_failed",
-            "charge_start was sent but the vehicle is not charging",
+            "charge_start was sent but the vehicle is not charging "
+            f"({detail}); check Charge on Solar or scheduled charging",
             priority=4,
             tags=("warning",),
+            cooldown=NOTIFY_TRIGGER_FAILED_COOLDOWN,
         )
         raise _ExitCode(3)
 

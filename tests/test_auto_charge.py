@@ -363,6 +363,17 @@ async def test_watch_notifies_auth_failure(config_dir):
     assert notifier.calls == ["auth_failed"]
 
 
+async def test_watch_trigger_failed_uses_cooldown(config_dir):
+    notifier = FakeNotifier()
+    notifier.last_run_value = time.time()
+    client = FakeClient(
+        pcts=[100.0], states=["Stopped"], start_error=ServiceUnavailable()
+    )
+    assert await watch(client, load_config(), once=True, notifier=notifier) == 3
+    assert notifier.calls == ["trigger_failed"]
+    assert notifier.cooldowns == [3600]
+
+
 async def test_run_sigint_notifies_stopped(config_dir):
     notifier = FakeNotifier()
     client = FakeClient(pcts=[0.0])
