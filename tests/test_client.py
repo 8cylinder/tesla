@@ -2,10 +2,12 @@ import stat
 import time
 
 import pytest
+from tesla_fleet_api.const import Method
 
 from tesla.client import (
     AuthError,
     Credentials,
+    build_oauth,
     ensure_fresh_token,
     extract_public_key,
     generate_key,
@@ -18,7 +20,7 @@ from tesla.client import (
     register_domain,
     registered_public_key,
 )
-from tesla.config import load_config
+from tesla.config import Config, load_config
 from tesla.tokens import Tokens, load_tokens
 
 
@@ -214,3 +216,22 @@ async def test_registered_public_key(config_dir):
         await registered_public_key(oauth, Credentials("id", "secret"), "example.com")
         == pem
     )
+
+
+async def test_bodyless_posts_get_empty_json(monkeypatch, config_dir):
+    calls = []
+
+    async def fake_base(self, method, path, params=None, json=None):
+        calls.append((method, path, json))
+        return {}
+
+    monkeypatch.setattr("tesla.client.TeslaFleetApi._request", fake_base)
+    oauth = build_oauth(object(), Credentials("id", "secret"), Config())
+    oauth._access_token = "tok"
+    oauth.expires = int(time.time()) + 3600
+    await oauth._request(Method.POST, "api/1/vehicles/VIN/wake_up")
+    await oauth._request(Method.POST, "api/1/vehicles/VIN/command/charge_start")
+    await oauth._request(Method.POST, "cmd", json={"percent": 80})
+    assert calls[0][2] == {}
+    assert calls[1][2] == {}
+    assert calls[2][2] == {"percent": 80}
