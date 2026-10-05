@@ -20,10 +20,12 @@ the latest =tesla-fleet-api= release; its current Python floor is 3.13.
 - A watch loop that polls the Powerwall and triggers =charge_start= on
   the car when the configured threshold is met.
 - Manual car charging commands.
+- Stage notifications via ntfy (state changes, failures, startup).
 - A structure that makes adding future commands cheap.
 
 Out of scope for v0.1 (possible follow-ups): telemetry streaming,
-BLE, scheduling, multiple vehicles/sites, notifications, web UI.
+BLE, scheduling, multiple vehicles/sites, other notification channels,
+web UI.
 
 * Decisions
 | Topic             | Decision                                                                                                                                                                                               |
@@ -168,7 +170,7 @@ only if =products()= 403" fallback.
 tesla/
 ├── pyproject.toml            # [project.scripts] tesla = "tesla.cli:main"
 ├── uv.lock
-├── README.md                 # setup, auth, systemd, troubleshooting
+├── README.md                 # setup, auth, notifications, systemd, troubleshooting
 ├── .env.example              # TESLA_CLIENT_ID / TESLA_CLIENT_SECRET / TESLA_REDIRECT_URI
 ├── .gitignore
 ├── .github/workflows/ci.yml  # ruff + pytest (M6)
@@ -181,22 +183,26 @@ tesla/
 │   ├── client.py             # aiohttp session, TeslaFleetOAuth, vehicle/site factories
 │   ├── powerwall.py          # live_status -> percentage_charged (ratio fallback)
 │   ├── car.py                # charge_state read, plug detection, wake, start/stop/limit
-│   ├── auto_charge.py        # pure decision logic + watch loop
+│   ├── auto_charge.py        # pure decision logic + watch loop + notifications
+│   ├── notify.py             # ntfy publish, situation gating, cooldowns
 │   └── logging.py            # stdlib logging setup (-v / --log-file)
 └── tests/
     ├── conftest.py           # fake client/session fixtures, tmp config dirs
     ├── test_config.py
     ├── test_tokens.py
+    ├── test_client.py        # credentials, callbacks, keys, Content-Type fix
     ├── test_powerwall.py
     ├── test_car.py
     ├── test_auto_charge.py
+    ├── test_notify.py        # payload shape, cooldowns, situation state
     └── test_cli.py           # Click CliRunner
 #+end_src
 
-Dependencies: latest =tesla-fleet-api= (>= 1.15), =aiohttp=, =click=, =rich=,
-optional =python-dotenv=. Dev group: =pytest=, =pytest-asyncio=, =ruff=. Note
-that =tesla-fleet-api= pulls in =cryptography=, =protobuf=, =tesla-protocol=,
-=bleak= and =aiolimiter= even though v0.1 never uses BLE.
+Dependencies: latest =tesla-fleet-api= (>= 1.15), =aiohttp=, =click=,
+=cryptography= (key handling and PEM normalization), =python-dotenv=,
+=rich=. Dev group: =pytest=, =pytest-asyncio=, =ruff=. Note that
+=tesla-fleet-api= pulls in =protobuf=, =tesla-protocol=, =bleak= and
+=aiolimiter= even though v0.1 never uses BLE.
 
 Client factory notes:
 - =oauth.vehicles.createFleet(vin)= (unsigned) or
@@ -274,6 +280,7 @@ on_start = true               # report current state on start/restart
 | =tesla config show / set=                | View/update config                                     |
 | =tesla key generate / register / status= | EC key creation; =partner.register()=; =fleet_status()=    |
 | =tesla doctor=                           | Validate config, auth, connectivity, IDs, scopes       |
+| =tesla --help / -h=                      | Help; =-h= works on every subcommand                     |
 | =tesla --version=                        | =importlib.metadata.version("tesla")=                    |
 
 =auto-charge= flags: =--threshold N=, =--interval S=, =--dry-run=, =--once=.
@@ -349,6 +356,13 @@ action.
 - Never call =charge_start= unless the threshold condition is true; never
   re-send once charging; =NoPower= / =Disconnected= -> wait, do not spam
   commands.
+- =~/.config/tesla/notify_state.json= (0644, non-secret) stores the last
+  notified situation, the last-run time, and event cooldowns; legacy or
+  malformed files degrade to empty state. =tesla notify reset= deletes it.
+- Notifications are best-effort: a failed publish is logged and ignored.
+  Condition messages fire only on a situation change, with an =on_start=
+  snapshot on process start (resident) or after a gap (timer); events are
+  always sent, with =trigger_failed=/=poll_failed= rate-limited.
 - Lock file: =~/.config/tesla/auto-charge.lock= holds a PID. A live PID ->
   exit 2; a stale PID (process gone) is replaced; the lock is released on
   SIGINT/SIGTERM.
@@ -356,18 +370,25 @@ action.
 * Testing
 - Pure =decide(...)= in =auto_charge.py= unit-tested against the truth
   table above: below/at/above threshold, plugged, unplugged, already
-  charging, complete, unknown/missing reading, =require_plugged= both ways.
+  charging, complete, unknown/missing reading, =require_plugged= both ways,
+  and the Asleep case.
 - =powerwall.py= tests for =percentage_charged=, the ratio fallback, and
   ZeroDivisionError/missing-key paths.
 - =tokens.py= tests: atomic replace, 0600 enforcement, rotation
   persistence.
 - =config.py= tests for precedence (flag > env > .env > file), type
-  validation, unknown-key rejection, redaction.
-- Async loop tests with a fake client (no network), =pytest-asyncio=:
-  threshold met, wake timeout, dry-run sends nothing, backoff stops after
-  the cap, SIGINT exits cleanly.
-- =cli.py= smoke tests via Click =CliRunner=: =--version=, =config show/set=,
-  =doctor= exit codes.
+  validation, unknown-key rejection, redaction, and the =[notify]= section.
+- =client.py= tests: credential precedence, callback parsing, token
+  rotation, key helpers, and the bodyless-POST JSON Content-Type fix.
+- =notify.py= tests: request payload and auth header, cooldown and
+  situation gating, verbose, =min_priority=, legacy state files, and the
+  startup snapshot.
+- Async loop tests with a fake client and fake notifier (no network),
+  =pytest-asyncio=: threshold met, wake timeout, dry-run sends nothing,
+  state-change and startup notifications, backoff stops after the cap,
+  SIGINT exits cleanly.
+- =cli.py= smoke tests via Click =CliRunner=: =--version=, =-h=,
+  =config show/set=, =notify test/reset=, =doctor= exit codes.
 - Lint gate: =ruff check= and =ruff format --check=; tests via
   =uv run pytest=. CI (M6) runs both on Python 3.13.
 
