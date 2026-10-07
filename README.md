@@ -143,6 +143,8 @@ require_plugged = true
 wake_timeout_seconds = 90
 set_charge_limit = 0           # 0 = leave unchanged
 max_runtime_hours = 0          # 0 = unlimited
+charge_on_solar = false        # true = CoS gate mode
+stop_margin = 5.0              # latch charging off below threshold - margin
 
 [notify]
 enabled = false
@@ -343,6 +345,44 @@ after 5 consecutive failures. Exit codes: `0` triggered/nothing to do,
 Flags: `--threshold N`, `--interval S`, `--dry-run` (never wakes or
 commands), `--once` (one evaluation pass, no sleeping).
 
+### Charge on Solar gate mode
+
+With `auto_charge.charge_on_solar = true`, the loop stops being a
+one-shot trigger and becomes a gate around the charge switch while
+**Charge on Solar** stays enabled in the Tesla app (the CLI never
+changes the CoS setting):
+
+- Start charging at `threshold` (set it to 95% for the Powerwall-first
+  behavior) when the car is stopped and its SOC is at or above the CoS
+  lower limit.
+- Leave CoS alone while it charges on surplus solar, pauses for clouds,
+  or reports `POWERWALL_CHARGE_PRIORITY`.
+- Below `threshold - stop_margin` (default 5%, so below 90%), latch
+  charging off with `charge_stop`; CoS stays enabled but will not resume
+  by itself until the loop sends `charge_start` again at the threshold.
+- Stop any non-solar charging (`charging_on_anything`) and alert.
+- Never start when CoS is disabled or the car SOC is below the CoS
+  lower limit (that would allow any-source charging and drain the
+  Powerwall).
+
+The decision function is a flat truth table over
+`charge_state.managed_charging_state.charge_on_solar_state` and the
+Powerwall reading; the executor performs the wake/start/stop. If the
+REST `vehicle_data` call does not carry `managed_charging_state` on a
+given firmware, the loop falls back to `charging_state`. `tesla car
+status` shows CoS enabled/disabled, the live state and reason, and the
+lower/upper limits.
+
+```sh
+uv run tesla config set auto_charge.charge_on_solar true
+uv run tesla config set auto_charge.threshold 95
+uv run tesla config set auto_charge.stop_margin 5
+```
+
+`--once` performs one evaluation pass (timer mode); a resident
+`tesla auto-charge` keeps running and latches/re-arms across the day.
+Exit codes and backoff are unchanged.
+
 ## Notifications with ntfy
 
 The CLI can push [ntfy](https://ntfy.sh) notifications at each
@@ -380,6 +420,12 @@ auto-charge stage and after manual charging commands.
 | wait_plug | entered "at threshold, waiting": asleep, unplugged with `require_plugged`, or unknown state | 3 |
 | charging | `charge_start` verified `Charging` | 4 |
 | already_charging | entered "at threshold, already charging/complete" | 2 |
+| charging_paused | CoS-gate only: paused for insufficient solar, will resume | 3 |
+| charging_stopped | CoS-gate only: latched off below `threshold - stop_margin` | 3 |
+| waiting_powerwall | CoS-gate only: waiting for the Powerwall to reach `threshold` | 3 |
+| cos_disabled | CoS-gate only: Charge on Solar not enabled, not starting | 5 |
+| cos_lower_limit | CoS-gate only: car below the CoS lower limit, not starting | 3 |
+| charging_on_grid | CoS-gate only: grid/Powerwall charging detected, stopped | 4 |
 | trigger_failed / poll_failed | wake, command, verification, or poll error | 4 / 3 |
 | gave_up | 5 consecutive failures | 5 |
 | auth_failed | token problem; re-run `tesla auth login` | 5 |
@@ -445,7 +491,9 @@ runs while observing, or temporarily lengthen `OnUnitActiveSec`.
   owns charging while waiting for solar), a scheduled/departure-time
   charge is set, or the battery is already at its charge limit. Turn off
   Charge on Solar if you want this CLI to command charging
-  unconditionally.
+  unconditionally, or switch to the CoS gate
+  (`auto_charge.charge_on_solar = true`), which expects CoS to be parked
+  and does not treat that as a failure.
 - `Tesla did not return a refresh token` or other auth errors: re-run
   `tesla auth login`; authorization codes expire quickly.
 - `tokens.json is mode 0644`: the CLI refuses to read a token file with

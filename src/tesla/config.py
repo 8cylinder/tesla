@@ -65,6 +65,8 @@ class AutoChargeConfig:
     wake_timeout_seconds: int = 90
     set_charge_limit: int = 0
     max_runtime_hours: float = 0.0
+    charge_on_solar: bool = False
+    stop_margin: float = 5.0
 
 
 @dataclass
@@ -113,6 +115,8 @@ _SCHEMA: dict[str, Any] = {
         "wake_timeout_seconds": int,
         "set_charge_limit": int,
         "max_runtime_hours": float,
+        "charge_on_solar": bool,
+        "stop_margin": float,
     },
     "notify": {
         "enabled": bool,
@@ -174,6 +178,12 @@ def _check_values(config: Config) -> None:
         raise ConfigError("auto_charge.set_charge_limit must be in [0, 100]")
     if config.auto_charge.max_runtime_hours < 0:
         raise ConfigError("auto_charge.max_runtime_hours must be >= 0")
+    if config.auto_charge.stop_margin < 0:
+        raise ConfigError("auto_charge.stop_margin must be >= 0")
+    if config.auto_charge.stop_margin >= config.auto_charge.threshold:
+        raise ConfigError(
+            "auto_charge.stop_margin must be less than auto_charge.threshold"
+        )
     if not 1 <= config.notify.priority <= 5:
         raise ConfigError("notify.priority must be in [1, 5]")
     if not 1 <= config.notify.min_priority <= 5:
@@ -294,6 +304,8 @@ def dump_toml(config: Config) -> str:
         f"wake_timeout_seconds = {_toml(auto.wake_timeout_seconds)}",
         f"set_charge_limit = {_toml(auto.set_charge_limit)}",
         f"max_runtime_hours = {_toml(auto.max_runtime_hours)}",
+        f"charge_on_solar = {_toml(auto.charge_on_solar)}",
+        f"stop_margin = {_toml(auto.stop_margin)}",
         "",
         "[notify]",
         f"enabled = {_toml(config.notify.enabled)}",

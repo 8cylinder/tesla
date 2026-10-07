@@ -13,12 +13,15 @@ from tesla_fleet_api.exceptions import (
 from tesla.auto_charge import (
     Action,
     AlreadyRunning,
+    Decision,
     LockFile,
     backoff_delay,
     decide,
+    decide_charge_on_solar,
     run,
     watch,
 )
+from tesla.car import ChargeOnSolarSettings, VehicleStatus
 from tesla.config import load_config
 
 
@@ -382,3 +385,287 @@ async def test_run_sigint_notifies_stopped(config_dir):
     os.kill(os.getpid(), signal.SIGINT)
     assert await asyncio.wait_for(task, timeout=2) == 0
     assert "stopped" in notifier.calls
+
+
+COS = ChargeOnSolarSettings(enabled=True, lower_limit=20.0, upper_limit=80.0)
+
+
+@pytest.mark.parametrize(
+    ("pct", "state", "battery", "cos_state", "cos_reason", "cos", "action", "reason"),
+    [
+        (95.0, "Stopped", 60, None, None, COS, Action.START, None),
+        (94.9, "Stopped", 60, None, None, COS, Action.SLEEP, "waiting_powerwall"),
+        (95.0, "Stopped", 10, None, None, COS, Action.WAIT, "cos_lower_limit"),
+        (None, "Stopped", 60, None, None, COS, Action.WAIT, None),
+        (92.0, "Charging", 60, None, None, COS, Action.SLEEP, None),
+        (89.9, "Charging", 60, None, None, COS, Action.STOP, "charging_stopped"),
+        (
+            96.0,
+            "Charging",
+            60,
+            "charging_on_anything",
+            None,
+            COS,
+            Action.STOP,
+            "charging_on_grid",
+        ),
+        (
+            96.0,
+            "Charging",
+            60,
+            "charging_on_excess_solar",
+            None,
+            COS,
+            Action.SLEEP,
+            None,
+        ),
+        (
+            92.0,
+            "Stopped",
+            60,
+            "no_charge_recommended",
+            "INSUFFICIENT_SOLAR",
+            COS,
+            Action.SLEEP,
+            "charging_paused",
+        ),
+        (
+            89.0,
+            "Stopped",
+            60,
+            "no_charge_recommended",
+            "INSUFFICIENT_SOLAR",
+            COS,
+            Action.STOP,
+            "charging_stopped",
+        ),
+        (
+            89.0,
+            "Stopped",
+            60,
+            "no_charge_recommended",
+            "POWERWALL_CHARGE_PRIORITY",
+            COS,
+            Action.SLEEP,
+            "waiting_powerwall",
+        ),
+        (
+            92.0,
+            "Stopped",
+            60,
+            "waiting_for_server",
+            None,
+            COS,
+            Action.SLEEP,
+            "charging_paused",
+        ),
+        (95.0, "Stopped", 60, "user_stopped", None, COS, Action.START, None),
+        (
+            95.0,
+            "Stopped",
+            10,
+            "user_stopped",
+            None,
+            COS,
+            Action.WAIT,
+            "cos_lower_limit",
+        ),
+        (
+            94.9,
+            "Stopped",
+            60,
+            "user_stopped",
+            None,
+            COS,
+            Action.SLEEP,
+            "waiting_powerwall",
+        ),
+        (95.0, "Disconnected", 60, None, None, COS, Action.SLEEP, "wait_plug"),
+        (95.0, "Complete", 60, None, None, COS, Action.DONE, None),
+        (95.0, "Stopped", 80, None, None, COS, Action.DONE, None),
+        (
+            95.0,
+            "Stopped",
+            60,
+            None,
+            None,
+            ChargeOnSolarSettings(enabled=False),
+            Action.WAIT,
+            "cos_disabled",
+        ),
+        (95.0, "Stopped", 60, "user_disabled", None, COS, Action.WAIT, "cos_disabled"),
+        (95.0, None, None, None, None, COS, Action.WAIT, None),
+    ],
+)
+def test_decide_charge_on_solar(
+    pct, state, battery, cos_state, cos_reason, cos, action, reason
+):
+    status = VehicleStatus(
+        charging_state=state,
+        battery_level=battery,
+        cos_state=cos_state,
+        cos_reason=cos_reason,
+    )
+    decision = decide_charge_on_solar(pct, 95.0, 5.0, status, cos)
+    assert decision == Decision(action, reason)
+
+
+class FakeGateClient:
+    def __init__(self, pcts=None, statuses=None, cos=None):
+        self.pcts = list(pcts) if pcts is not None else []
+        self.statuses = list(statuses) if statuses is not None else []
+        self.cos = (
+            cos
+            if cos is not None
+            else ChargeOnSolarSettings(enabled=True, lower_limit=20.0, upper_limit=80.0)
+        )
+        self.current_pct = 0.0
+        self.current_status = VehicleStatus()
+        self.woken = 0
+        self.started = 0
+        self.stopped = 0
+        self.limits = []
+
+    async def refresh(self):
+        return None
+
+    async def powerwall_percentage(self):
+        if self.pcts:
+            self.current_pct = self.pcts.pop(0)
+        return self.current_pct
+
+    async def vehicle_status(self):
+        if self.statuses:
+            self.current_status = self.statuses.pop(0)
+        return self.current_status
+
+    async def charge_on_solar_settings(self):
+        return self.cos
+
+    async def wake(self):
+        self.woken += 1
+
+    async def charging_state(self):
+        return self.current_status.charging_state
+
+    async def set_charge_limit(self, percent):
+        self.limits.append(percent)
+
+    async def start_charging(self):
+        self.started += 1
+
+    async def stop_charging(self):
+        self.stopped += 1
+
+
+def gate_config():
+    config = load_config()
+    config.auto_charge.charge_on_solar = True
+    config.auto_charge.threshold = 95.0
+    config.auto_charge.stop_margin = 5.0
+    return config
+
+
+async def test_gate_starts_at_threshold(config_dir):
+    client = FakeGateClient(
+        pcts=[95.0],
+        statuses=[VehicleStatus(charging_state="Stopped", battery_level=60)],
+    )
+    assert await watch(client, gate_config(), once=True) == 0
+    assert (client.woken, client.started, client.stopped) == (1, 1, 0)
+
+
+async def test_gate_ignores_band_while_charging(config_dir):
+    client = FakeGateClient(
+        pcts=[92.0],
+        statuses=[VehicleStatus(charging_state="Charging", battery_level=60)],
+    )
+    assert await watch(client, gate_config(), once=True) == 0
+    assert (client.started, client.stopped) == (0, 0)
+
+
+async def test_gate_latches_below_floor(config_dir):
+    client = FakeGateClient(
+        pcts=[89.0],
+        statuses=[VehicleStatus(charging_state="Charging", battery_level=60)],
+    )
+    assert await watch(client, gate_config(), once=True) == 0
+    assert (client.started, client.stopped) == (0, 1)
+
+
+async def test_gate_rearms_when_powerwall_full(config_dir):
+    client = FakeGateClient(
+        pcts=[95.0],
+        statuses=[
+            VehicleStatus(
+                charging_state="Stopped",
+                battery_level=60,
+                cos_state="user_stopped",
+            )
+        ],
+    )
+    assert await watch(client, gate_config(), once=True) == 0
+    assert client.started == 1
+
+
+async def test_gate_waits_when_cos_disabled(config_dir):
+    client = FakeGateClient(
+        pcts=[95.0],
+        statuses=[VehicleStatus(charging_state="Stopped", battery_level=60)],
+        cos=ChargeOnSolarSettings(enabled=False),
+    )
+    assert await watch(client, gate_config(), once=True) == 0
+    assert (client.started, client.stopped) == (0, 0)
+
+
+async def test_gate_waits_below_lower_limit(config_dir):
+    client = FakeGateClient(
+        pcts=[95.0],
+        statuses=[VehicleStatus(charging_state="Stopped", battery_level=10)],
+    )
+    assert await watch(client, gate_config(), once=True) == 0
+    assert client.started == 0
+
+
+async def test_gate_stops_non_solar_charge(config_dir):
+    notifier = FakeNotifier()
+    client = FakeGateClient(
+        pcts=[96.0],
+        statuses=[
+            VehicleStatus(
+                charging_state="Charging",
+                battery_level=60,
+                cos_state="charging_on_anything",
+            )
+        ],
+    )
+    assert await watch(client, gate_config(), once=True, notifier=notifier) == 0
+    assert client.stopped == 1
+    assert "charging_on_grid" in notifier.calls
+
+
+async def test_gate_paused_above_floor_is_left_alone(config_dir):
+    notifier = FakeNotifier()
+    client = FakeGateClient(
+        pcts=[92.0],
+        statuses=[
+            VehicleStatus(
+                charging_state="Stopped",
+                battery_level=60,
+                cos_state="no_charge_recommended",
+                cos_reason="INSUFFICIENT_SOLAR",
+            )
+        ],
+    )
+    assert await watch(client, gate_config(), once=True, notifier=notifier) == 0
+    assert (client.started, client.stopped) == (0, 0)
+    assert notifier.situations == ["charging_paused"]
+
+
+async def test_gate_dry_run_sends_nothing(config_dir):
+    client = FakeGateClient(
+        pcts=[95.0],
+        statuses=[VehicleStatus(charging_state="Stopped", battery_level=60)],
+    )
+    assert await watch(client, gate_config(), dry_run=True, once=True) == 0
+    assert (client.woken, client.started, client.stopped) == (0, 0, 0)

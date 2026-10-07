@@ -162,3 +162,32 @@ def test_notify_round_trip(config_dir):
     config.notify.tags = "tesla,powerwall"
     save_config(config)
     assert load_config().notify == config.notify
+
+
+def test_auto_charge_cos_defaults_and_set():
+    config = Config()
+    assert config.auto_charge.charge_on_solar is False
+    assert config.auto_charge.stop_margin == 5.0
+    set_dotted(config, "auto_charge.charge_on_solar", "true")
+    set_dotted(config, "auto_charge.stop_margin", "5")
+    assert config.auto_charge.charge_on_solar is True
+    assert config.auto_charge.stop_margin == 5.0
+
+
+def test_stop_margin_validation():
+    with pytest.raises(ConfigError, match="stop_margin"):
+        set_dotted(Config(), "auto_charge.stop_margin", "-1")
+    with pytest.raises(ConfigError, match="stop_margin"):
+        set_dotted(Config(), "auto_charge.stop_margin", "100")
+
+
+def test_auto_charge_cos_round_trip(config_dir):
+    config = Config()
+    config.auto_charge.charge_on_solar = True
+    config.auto_charge.threshold = 95.0
+    config.auto_charge.stop_margin = 5.0
+    save_config(config)
+    loaded = load_config()
+    assert loaded.auto_charge.charge_on_solar is True
+    assert loaded.auto_charge.threshold == 95.0
+    assert loaded.auto_charge.stop_margin == 5.0

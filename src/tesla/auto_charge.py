@@ -10,6 +10,7 @@ import signal
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -24,7 +25,15 @@ from tesla_fleet_api.exceptions import (
     VehicleOffline,
 )
 
+from .car import (
+    ChargeOnSolarSettings,
+    VehicleStatus,
+)
+from .car import (
+    charge_on_solar_settings as read_cos_settings,
+)
 from .car import charging_state as read_charging_state
+from .car import vehicle_status as read_vehicle_status
 from .client import build_vehicle, ensure_fresh_token
 from .config import Config, ConfigError
 from .powerwall import percentage_charged
@@ -44,8 +53,17 @@ class Action(Enum):
     DONE = "done"
     WAIT_PLUG = "wait_plug"
     START = "start"
+    STOP = "stop"
     WAIT = "wait"
     SLEEP = "sleep"
+
+
+@dataclass(frozen=True)
+class Decision:
+    """One row of the CoS gate truth table: an action plus a notify reason."""
+
+    action: Action
+    reason: str | None = None
 
 
 def decide(
@@ -66,6 +84,80 @@ def decide(
     if charging_state == "Asleep":
         return Action.WAIT if require_plugged else Action.START
     return Action.WAIT
+
+
+def _at_upper_limit(status: VehicleStatus, cos: ChargeOnSolarSettings) -> bool:
+    return (
+        status.battery_level is not None
+        and cos.upper_limit is not None
+        and status.battery_level >= cos.upper_limit
+    )
+
+
+def _below_lower_limit(status: VehicleStatus, cos: ChargeOnSolarSettings) -> bool:
+    return (
+        status.battery_level is not None
+        and cos.lower_limit is not None
+        and status.battery_level < cos.lower_limit
+    )
+
+
+def _below_floor(
+    powerwall_pct: float | None,
+    stop: float,
+    low_reason: str,
+    high_reason: str | None = None,
+) -> Decision:
+    if powerwall_pct is not None and powerwall_pct < stop:
+        return Decision(Action.STOP, low_reason)
+    return Decision(Action.SLEEP, high_reason)
+
+
+def decide_charge_on_solar(
+    powerwall_pct: float | None,
+    threshold: float,
+    stop_margin: float,
+    status: VehicleStatus,
+    cos: ChargeOnSolarSettings,
+) -> Decision:
+    """CoS gate truth table; one branch per row. No side effects."""
+    stop = threshold - stop_margin
+    state = status.charging_state
+    if not cos.enabled or status.cos_state == "user_disabled":
+        return Decision(Action.WAIT, "cos_disabled")
+    if state == "Disconnected":
+        return Decision(Action.SLEEP, "wait_plug")
+    if state == "Complete":
+        return Decision(Action.DONE)
+    if _at_upper_limit(status, cos):
+        return Decision(Action.DONE)
+    if status.cos_state == "charging_on_anything":
+        return Decision(Action.STOP, "charging_on_grid")
+    if state in ("Charging", "Starting", "Calibrating"):
+        return _below_floor(powerwall_pct, stop, "charging_stopped")
+    if status.cos_state == "no_charge_recommended":
+        if status.cos_reason == "POWERWALL_CHARGE_PRIORITY":
+            return Decision(Action.SLEEP, "waiting_powerwall")
+        return _below_floor(powerwall_pct, stop, "charging_stopped", "charging_paused")
+    if status.cos_state == "waiting_for_server":
+        return _below_floor(powerwall_pct, stop, "charging_stopped", "charging_paused")
+    if status.cos_state == "charging_on_excess_solar":
+        return Decision(Action.SLEEP)
+    if status.cos_state == "user_stopped":
+        if powerwall_pct is None or powerwall_pct < threshold:
+            return Decision(Action.SLEEP, "waiting_powerwall")
+        if _below_lower_limit(status, cos):
+            return Decision(Action.WAIT, "cos_lower_limit")
+        return Decision(Action.START)
+    if state in ("Stopped", "NoPower"):
+        if powerwall_pct is None:
+            return Decision(Action.WAIT)
+        if powerwall_pct >= threshold:
+            if _below_lower_limit(status, cos):
+                return Decision(Action.WAIT, "cos_lower_limit")
+            return Decision(Action.START)
+        return Decision(Action.SLEEP, "waiting_powerwall")
+    return Decision(Action.WAIT)
 
 
 def backoff_delay(
@@ -146,6 +238,20 @@ class TeslaAutoChargeClient:
     async def charging_state(self) -> str | None:
         data = await self._vehicle.vehicle_data(endpoints=["charge_state"])
         return read_charging_state(data)
+
+    async def vehicle_status(self) -> VehicleStatus:
+        data = await self._vehicle.vehicle_data(endpoints=["charge_state"])
+        return read_vehicle_status(data)
+
+    async def charge_on_solar_settings(self) -> ChargeOnSolarSettings | None:
+        """Read the app-side CoS setting; None when unsupported (fleet mode)."""
+        get = getattr(self._vehicle, "get_charge_on_solar", None)
+        if get is None:
+            return None
+        return read_cos_settings(await get())
+
+    async def stop_charging(self) -> None:
+        await self._vehicle.charge_stop()
 
     async def wake(self) -> None:
         await self._vehicle.wake_up(
@@ -293,6 +399,11 @@ class AutoCharger:
             self._note_situation("already_charging")
 
     async def run(self) -> int:
+        if self.auto.charge_on_solar:
+            return await self._run_gate()
+        return await self._run_classic()
+
+    async def _run_classic(self) -> int:
         self._report_due = self._startup_report_due()
         self._touch()
         while True:
@@ -450,6 +561,300 @@ class AutoCharger:
             if self.once:
                 return 0
             await self.sleep(self.auto.poll_interval_seconds)
+
+    async def _auth_failure(self, exc: BaseException) -> int:
+        LOGGER.error("authentication failed: %s; re-run 'tesla auth login'", exc)
+        await self._notify(
+            "auth_failed",
+            f"authentication failed: {exc}; re-run 'tesla auth login'",
+            priority=5,
+            tags=("rotating_light",),
+        )
+        return 2
+
+    async def _run_gate(self) -> int:
+        """Keep the charge switch off until the Powerwall is ready for CoS."""
+        self._report_due = self._startup_report_due()
+        self._touch()
+        settings: ChargeOnSolarSettings | None = None
+        loaded = False
+        while True:
+            if self.auto.max_runtime_hours:
+                elapsed = self.clock() - self.started_at
+                if elapsed >= self.auto.max_runtime_hours * 3600:
+                    LOGGER.error(
+                        "max runtime of %s h reached before a trigger",
+                        self.auto.max_runtime_hours,
+                    )
+                    await self._notify(
+                        "max_runtime",
+                        "max runtime reached before a trigger",
+                        priority=4,
+                        tags=("warning",),
+                    )
+                    return 3
+            try:
+                await self.client.refresh()
+                pct = await self.client.powerwall_percentage()
+            except AUTH_ERRORS as exc:
+                return await self._auth_failure(exc)
+            except (TeslaFleetError, aiohttp.ClientError) as exc:
+                code = await self._backoff(exc)
+                if code is not None:
+                    return code
+                continue
+            try:
+                status = await self.client.vehicle_status()
+            except AUTH_ERRORS as exc:
+                return await self._auth_failure(exc)
+            except VehicleOffline:
+                status = VehicleStatus()
+            except (TeslaFleetError, aiohttp.ClientError) as exc:
+                code = await self._backoff(exc)
+                if code is not None:
+                    return code
+                continue
+            if not loaded:
+                try:
+                    settings = await self.client.charge_on_solar_settings()
+                except AUTH_ERRORS as exc:
+                    return await self._auth_failure(exc)
+                except (TeslaFleetError, aiohttp.ClientError) as exc:
+                    code = await self._backoff(exc)
+                    if code is not None:
+                        return code
+                    continue
+                loaded = True
+            decision = decide_charge_on_solar(
+                pct,
+                self.auto.threshold,
+                self.auto.stop_margin,
+                status,
+                settings or ChargeOnSolarSettings(),
+            )
+            self.failures = 0
+            if self._report_due:
+                await self._gate_startup_report(pct, status, decision)
+                self._report_due = False
+            if decision.action is Action.START:
+                try:
+                    result = await self._start_gate()
+                except _ExitCode as exc:
+                    return exc.code
+                if result is TriggerResult.STARTED:
+                    await self._notify(
+                        "charging",
+                        "charging started",
+                        priority=4,
+                        tags=("zap", "heavy_check_mark"),
+                    )
+                elif result is TriggerResult.RETRY:
+                    code = await self._gate_retry()
+                    if code is not None:
+                        return code
+                    continue
+            elif decision.action is Action.STOP:
+                try:
+                    result = await self._stop_gate(decision.reason)
+                except _ExitCode as exc:
+                    return exc.code
+                if result is TriggerResult.RETRY:
+                    code = await self._gate_retry()
+                    if code is not None:
+                        return code
+                    continue
+            else:
+                await self._note_gate(decision, pct)
+            if self.once:
+                return 0
+            await self.sleep(self.auto.poll_interval_seconds)
+
+    async def _gate_retry(self) -> int | None:
+        self.failures += 1
+        if self.failures >= MAX_FAILURES:
+            LOGGER.error("giving up after %s gate failures", self.failures)
+            await self._notify(
+                "gave_up",
+                f"giving up after {self.failures} consecutive gate failures",
+                priority=5,
+                tags=("rotating_light",),
+            )
+            return 3
+        await self.sleep(backoff_delay(self.failures, self.jitter))
+        return None
+
+    async def _gate_startup_report(
+        self, pct: float | None, status: VehicleStatus, decision: Decision
+    ) -> None:
+        pct_text = "unavailable" if pct is None else f"{pct:.1f}%"
+        car = status.charging_state or status.cos_state or "unknown"
+        message = (
+            f"watcher started; Powerwall {pct_text}; car {car}; "
+            f"action {decision.action.value}"
+        )
+        await self._notify(
+            "on_start", message, priority=2, tags=("information_source",)
+        )
+        if decision.reason:
+            self._note_situation(decision.reason)
+
+    async def _note_gate(self, decision: Decision, pct: float | None) -> None:
+        reason = decision.reason
+        if reason == "cos_disabled":
+            await self._notify(
+                "cos_disabled",
+                "Charge on Solar is not enabled; not starting "
+                "(would drain the Powerwall)",
+                priority=5,
+                tags=("rotating_light",),
+                on_change="cos_disabled",
+            )
+        elif reason == "cos_lower_limit":
+            await self._notify(
+                "cos_lower_limit",
+                "car is below the Charge on Solar lower limit; waiting to "
+                "avoid any-source charging",
+                priority=3,
+                tags=("warning",),
+                on_change="cos_lower_limit",
+            )
+        elif reason == "charging_paused":
+            await self._notify(
+                "charging_paused",
+                "charging paused: solar too low; CoS will resume on its own",
+                priority=3,
+                tags=("cloud",),
+                on_change="charging_paused",
+            )
+        elif reason == "waiting_powerwall":
+            detail = "reading unavailable" if pct is None else f"at {pct:.1f}%"
+            await self._notify(
+                "waiting_powerwall",
+                f"waiting for the Powerwall ({detail}) to reach "
+                f"{self.auto.threshold:g}%",
+                priority=3,
+                tags=("battery",),
+                on_change="waiting_powerwall",
+            )
+        elif reason == "wait_plug":
+            await self._notify(
+                "wait_plug",
+                "waiting for the car to be plugged in",
+                priority=3,
+                tags=("electric_plug",),
+                on_change="wait_plug",
+            )
+
+    async def _start_gate(self) -> TriggerResult:
+        """Wake and charge_start; CoS governs the power from there."""
+        if self.dry_run:
+            LOGGER.info("[dry-run] would wake the car and charge_start")
+            return TriggerResult.STARTED
+        try:
+            await self.client.wake()
+            if self.auto.require_plugged:
+                state = await self.client.charging_state()
+                if state == "Disconnected":
+                    LOGGER.info("vehicle is awake but not plugged in; waiting")
+                    await self._notify(
+                        "wait_plug",
+                        "vehicle is awake but not plugged in; waiting for plug",
+                        priority=3,
+                        tags=("electric_plug",),
+                        on_change="wait_plug",
+                    )
+                    return TriggerResult.WAIT
+            if self.auto.set_charge_limit:
+                await self.client.set_charge_limit(self.auto.set_charge_limit)
+            await self.client.start_charging()
+        except AUTH_ERRORS as exc:
+            LOGGER.error("authentication failed: %s; re-run 'tesla auth login'", exc)
+            await self._notify(
+                "auth_failed",
+                f"authentication failed: {exc}; re-run 'tesla auth login'",
+                priority=5,
+                tags=("rotating_light",),
+            )
+            raise _ExitCode(2) from exc
+        except (TeslaFleetError, aiohttp.ClientError) as exc:
+            if self.once:
+                LOGGER.error("trigger failed: %s", exc)
+                await self._notify(
+                    "trigger_failed",
+                    f"charge trigger failed: {exc}",
+                    priority=4,
+                    tags=("warning",),
+                    cooldown=NOTIFY_TRIGGER_FAILED_COOLDOWN,
+                )
+                raise _ExitCode(3) from exc
+            LOGGER.warning("trigger failed: %s", exc)
+            await self._notify(
+                "trigger_failed",
+                f"charge trigger failed: {exc}",
+                priority=4,
+                tags=("warning",),
+                cooldown=NOTIFY_TRIGGER_FAILED_COOLDOWN,
+            )
+            return TriggerResult.RETRY
+        LOGGER.info("charge_start sent (Charge on Solar governs the power)")
+        return TriggerResult.STARTED
+
+    async def _stop_gate(self, reason: str | None) -> TriggerResult:
+        """Latch charging off; CoS stays enabled and is re-armed at threshold."""
+        if self.dry_run:
+            LOGGER.info("[dry-run] would wake the car and charge_stop (%s)", reason)
+            return TriggerResult.STARTED
+        try:
+            await self.client.wake()
+            await self.client.stop_charging()
+        except AUTH_ERRORS as exc:
+            LOGGER.error("authentication failed: %s; re-run 'tesla auth login'", exc)
+            await self._notify(
+                "auth_failed",
+                f"authentication failed: {exc}; re-run 'tesla auth login'",
+                priority=5,
+                tags=("rotating_light",),
+            )
+            raise _ExitCode(2) from exc
+        except (TeslaFleetError, aiohttp.ClientError) as exc:
+            if self.once:
+                LOGGER.error("stop failed: %s", exc)
+                await self._notify(
+                    "trigger_failed",
+                    f"charge stop failed: {exc}",
+                    priority=4,
+                    tags=("warning",),
+                    cooldown=NOTIFY_TRIGGER_FAILED_COOLDOWN,
+                )
+                raise _ExitCode(3) from exc
+            LOGGER.warning("stop failed: %s", exc)
+            await self._notify(
+                "trigger_failed",
+                f"charge stop failed: {exc}",
+                priority=4,
+                tags=("warning",),
+                cooldown=NOTIFY_TRIGGER_FAILED_COOLDOWN,
+            )
+            return TriggerResult.RETRY
+        LOGGER.info("charge_stop sent; Charge on Solar stays enabled")
+        if reason == "charging_on_grid":
+            await self._notify(
+                "charging_on_grid",
+                "vehicle was charging from grid/Powerwall; charge_stop sent",
+                priority=4,
+                tags=("warning",),
+                cooldown=NOTIFY_TRIGGER_FAILED_COOLDOWN,
+            )
+        else:
+            await self._notify(
+                "charging_stopped",
+                "charging stopped: Powerwall below the stop floor; "
+                "Charge on Solar stays enabled",
+                priority=3,
+                tags=("stop_sign",),
+                on_change="charging_stopped",
+            )
+        return TriggerResult.STARTED
 
     async def _backoff(self, exc: BaseException) -> int | None:
         if self.once:

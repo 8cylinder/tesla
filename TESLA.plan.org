@@ -544,7 +544,7 @@ logs 'stopped by signal' and exits 0.
 
 /See:/ [[*Core flow: auto-charge]], [[*decide() truth table]], [[*Edge cases and error handling]].
 
-** NEXT M6 --- Charging commands and polish
+** DONE M6 --- Charging commands and polish
 Wake/plug handling and =charge_start= / =charge_stop= / =set_charge_limit=
 over the signed transport, =doctor=, CI, tests, README and systemd docs.
 /Done when:/ a real threshold crossing wakes the car, starts charging, and
@@ -568,12 +568,12 @@ The first live trigger surfaced the tesla-fleet-api empty-POST
 Content-Type bug (wake_up and unsigned commands); patched in
 =client.py::_fix_empty_json=, see Risks. Charging verification now waits
 ~60 s (six reads, 10 s apart) and reports the last observed state;
-=trigger_failed= notifications are rate-limited to hourly. Pending: a
-successful live end-to-end trigger and a live manual command.
+=trigger_failed= notifications are rate-limited to hourly. The live
+end-to-end trigger and manual command are carried into M8.
 
 /See:/ [[*CLI surface (v0.1)]], [[*Deployment]], [[*Testing]], [[*Risks and open items]].
 
-** TODO M7 --- Notifications (ntfy)
+** DONE M7 --- Notifications (ntfy)
 =notify.py= with =NtfyNotifier= (JSON publish, bearer token, best-effort),
 =NotifyState= (persisted situation + event cooldowns), and
 =build_notifier()=. Condition stages fire only on a situation change:
@@ -596,9 +596,205 @@ drops stages below a priority level and =notify.verbose= ignores the
 situation check and cooldowns for observation; =notify.on_start= can be
 disabled. iOS cannot filter by priority or pause subscriptions (Android
 gets per-priority channels), so tuning is server-side; tags provide the
-visual classification. Pending: live test with a real TESLA_NTFY_TOPIC
-(user has not set one yet), and a notify-enabled auto-charge
-dry-run/real run.
+visual classification. The live test with a real TESLA_NTFY_TOPIC (not
+set yet) is carried into M9.
+
+/See:/ [[*Configuration and tokens]], [[*Core flow: auto-charge]], [[*CLI surface (v0.1)]].
+
+** NEXT M8 --- Charge on Solar gate mode
+Keep *Charge on Solar* enabled and app-managed in the Tesla app; the loop
+only flips the charge switch (=charge_start= / =charge_stop=) so CoS can
+work only when the Powerwall is ready. CoS and the switch are
+independent: a stop is sticky (=user_stopped=) and does not disable CoS,
+so the loop mirrors the manual app taps exactly. v1 never toggles the
+CoS setting from the CLI; it only reads it.
+
+*Locked decisions:*
+- Start when the Powerwall reaches 95%
+  (=auto_charge.threshold= set to =95=; the default stays 100 for
+  backward compatibility, gate mode is opt-in).
+- Stop margin 5% (=auto_charge.stop_margin= of =5.0=): latch charging
+  off once the Powerwall falls below 90%.
+- Gate mode is opt-in: set =auto_charge.charge_on_solar= to =true=.
+- Car SOC below the CoS lower limit at a start decision -> =WAIT= +
+  alert (never start into "any source" charging).
+- Latch only when the Powerwall is below the stop floor, *not* on every
+  insufficient-solar pause: between 90 and 95 CoS pauses/resumes on its
+  own, so the Powerwall can use the low sun to finish topping up.
+- CoS remains enabled in the app; the loop never calls
+  =update_charge_on_solar=.
+
+*Loop behavior (priority order, first match wins):*
+| Condition                                      | Action            |
+|------------------------------------------------+-------------------|
+| CoS disabled                                   | WAIT + alert      |
+| Disconnected                                   | IDLE              |
+| Complete / SOC >= CoS upper limit              | IDLE              |
+| =charging_on_anything= (grid/Powerwall)        | STOP + alert      |
+| Charging/Starting, PW < 90                     | STOP (latch)      |
+| Charging/Starting, PW >= 90                    | IDLE              |
+| =no_charge_recommended= + =POWERWALL_CHARGE_PRIORITY= | IDLE       |
+| =no_charge_recommended= (other), PW < 90       | STOP (latch)      |
+| =no_charge_recommended= (other), PW >= 90      | IDLE (CoS resumes) |
+| =waiting_for_server=, PW < 90                  | STOP              |
+| =waiting_for_server=, PW >= 90                 | IDLE              |
+| =user_stopped=, PW >= 95                       | START             |
+| Stopped/NoPower, PW >= 95, SOC < CoS lower     | WAIT + alert      |
+| Stopped/NoPower, PW >= 95                      | START             |
+| Stopped/NoPower, PW < 95                       | IDLE              |
+| Asleep / unknown                               | WAIT              |
+
+*CoS state source:*
+- Live state is
+  =charge_state.managed_charging_state.charge_on_solar_state= with
+  =no_charge_recommended.reason= in {=INSUFFICIENT_SOLAR=,
+  =POWERWALL_CHARGE_PRIORITY=, =GRID_EXPORT_PRIORITY=,
+  =ALTERNATE_VEHICLE_CHARGE_PRIORITY=}, plus =minutes_to_lower_limit=.
+  Settings (enabled, lower/upper limits) come from
+  =vehicle.get_charge_on_solar()= (signed mode only).
+- Step 0: probe whether the REST =vehicle_data= call for
+  =charge_state= on the car's firmware includes
+  =managed_charging_state=. If not, read it over the signed
+  channel with =GetVehicleData= + =getChargeState= (=_getInfotainment=);
+  the last resort is inferring from =charging_state= + =charger_power= +
+  site =solar_power=.
+- =get_charge_on_solar()= returns settings only, never the live state.
+
+*Implementation:*
+1. =config.py=: add =auto_charge.charge_on_solar= (bool, default
+   =false=) and =auto_charge.stop_margin= (float, default =5.0=);
+   schema, =_check_values= (0 <= margin < threshold), =dump_toml=.
+2. =car.py=: parse =managed_charging_state= (state + reason), expose
+   =battery_level=; defensive against the JSON oneof shape.
+3. =auto_charge.py=: =Action.STOP=; pure =decide_charge_on_solar(...)=;
+   client =stop_charging()=, =charge_on_solar_settings()= and a combined
+   vehicle read; gate branch in =run()=; =_stop()= wakes only if the
+   command needs it; =_trigger()= accepts CoS-armed replies
+   (=no_charge_recommended= / =waiting_for_server=) instead of exiting 3
+   when the car is not immediately =Charging=. In gate mode the loop
+   reads the car every poll (offline read = asleep, no wake). The latch
+   is car-reported (=user_stopped=), so =--once= timer mode needs no
+   persisted state. The decision function is a flat,
+   one-branch-per-row table returning a =Decision(action, reason)=
+   (=reason= is a notification stage key); no I/O, logging, sleeps or
+   notifications inside the chain --- the executor performs all side
+   effects, and tests are parametrized one case per row.
+4. Notifications: condition stages =charging=, =charging_paused=
+   (insufficient solar), =charging_stopped= (latched),
+   =waiting_powerwall=; event alerts =cos_disabled=,
+   =cos_lower_limit=, =charging_on_grid=; reuse the change/cooldown
+   rules.
+5. =cli.py=: =car status= shows CoS enabled/state/reason/limits and
+   =minutes_to_lower_limit=.
+6. Tests: =test_auto_charge.py= (boundaries 89/90/95, latch and re-arm,
+   early-resume veto, =charging_on_anything= stop, CoS disabled,
+   lower-limit wait, dry-run), =test_car.py= parsing, =test_config.py=
+   validation and round-trip.
+7. README auto-charge semantics plus a "Charge on Solar gate mode"
+   section; update the =decide()= truth table and troubleshooting.
+
+/Done when:/ =auto_charge.charge_on_solar true= with =threshold 95= and
+=stop_margin 5= starts charging when the Powerwall reaches 95, latches
+off (CoS still enabled) when it falls below 90 while charging or paused,
+re-arms at 95 the next day, and sends no commands while CoS is disabled
+or the car is below the CoS lower limit. =uv run ruff check .=,
+=uv run ruff format --check .= and =uv run pytest -q= are green.
+
+/Actual:/ Implemented: =auto_charge.charge_on_solar= (opt-in) and
+=auto_charge.stop_margin=; flat =decide_charge_on_solar()= returning
+=Decision(action, reason)=; gate executor =_run_gate()= with
+=_start_gate()=/=_stop_gate()=; CoS state parsing
+(=managed_charging_state= plus =get_charge_on_solar()=); new ntfy
+stages; =car status= CoS rows. 181 tests, ruff clean. The live REST
+=managed_charging_state= probe still needs the car; when the field is
+absent the gate degrades to =charging_state=, and the signed
+=GetVehicleData= fallback is deferred until the probe shows it is
+needed. Live verification (start at 95, latch below 90, re-arm) is
+pending.
+
+*Resolved at implementation:*
+- Latch only below the stop floor, not on every insufficient-solar
+  pause.
+- v1 always re-arms at the threshold; no "respect a manual stop" option
+  (a remote stop is indistinguishable from =user_stopped=).
+- =charging_on_anything= -> STOP + alert (protects the Powerwall).
+- The signed =GetVehicleData= fallback is deferred until the REST
+  =managed_charging_state= probe shows it is needed; until then the gate
+  degrades to =charging_state=.
+
+*Risks:*
+- =charge_stop= may need a wake while the car is asleep; the STOP
+  action wakes once when crossing the floor so the latch sticks.
+- Gate mode needs signed command mode for =get_charge_on_solar()=;
+  =fleet= mode falls back to WAIT + alert.
+- If REST omits =managed_charging_state=, the signed =GetVehicleData=
+  read (or inference) is required; settle this with the step-0 probe.
+
+/See:/ [[*Core flow: auto-charge]], [[*decide() truth table]], [[*Testing]], [[*Risks and open items]].
+
+** TODO M9 --- Per-stage notification policies
+Replace the mix of =notify.min_priority=, =notify.verbose= and the
+hard-coded =poll_failed=/=trigger_failed= cooldowns with one explicit
+per-stage policy map. Stages without an entry keep today's behavior
+exactly.
+
+*Priority:* lower than M8; start this only after the CoS gate ships.
+
+[notify.policies]
+charging = "always"          # every occurrence
+charging_stopped = "24h"     # at most once per 24 h
+charging_paused = "change"   # fire on situation change
+on_start = "never"
+
+*Semantics:*
+- Unset stage keeps its built-in default: condition stages =wait_plug=,
+  =charging=, =already_charging=, =charging_paused=, =charging_stopped=,
+  =waiting_powerwall= behave as =change=; events =trigger_failed=,
+  =poll_failed=, =gave_up=, =auth_failed=, =max_runtime=, =cos_disabled=,
+  =cos_lower_limit=, =charging_on_grid=, =stopped= and =manual= as
+  =always=, with =poll_failed=/=trigger_failed= at =1h=; =on_start= keeps
+  its start/gap snapshot behavior.
+- =change=: fire only when the persisted situation changes.
+- =always=: bypass the situation check and all cooldowns.
+- =never=: suppress the stage, but still record the situation so a later
+  switch back to =change= is not stale.
+- =<duration>= (30s/15m/24h/7d): minimum interval between sends,
+  overriding the built-in cooldown.
+- *Explicit policy wins:* a stage with an entry is governed solely by
+  that entry; =min_priority= and =verbose= apply only to stages without
+  an entry (=verbose= kept for backward compatibility; may be deprecated
+  once policies are established).
+
+*CLI info command:* =tesla notify policies= (no token needed) prints a
+table of every stage with its built-in default, the user's override and
+the allowed values (=change | always | never | <duration>=), plus the
+active =min_priority=/=verbose= and a note that explicit policies win.
+
+*Implementation:*
+1. =config.py=: =NotifyConfig.policies: dict[str, str]=; an
+   open-string-map schema marker (keys validated against the stage
+   registry); duration validation; =dump_toml= renders the table.
+2. =notify.py=: =STAGES= registry carrying each stage's default policy,
+   =parse_duration()=, and policy resolution in =send()= (replacing the
+   inline verbose/on_change/cooldown logic); duration timestamps ride the
+   existing =NotifyState.sent=.
+3. =auto_charge.py=: delete the hard-coded cooldown constants
+   (=NOTIFY_POLL_FAILED_COOLDOWN=, =NOTIFY_TRIGGER_FAILED_COOLDOWN=);
+   the defaults live in the registry.
+4. =cli.py=: add =notify policies=; =notify reset= clears policy
+   cooldowns too (it already clears =sent=).
+5. Tests: policy table parsing, unknown stage/duration rejected at load
+   and =config set=, =never= advances the situation, =always= bypasses,
+   a duration window suppresses, unsets keep current defaults; README
+   "Tuning what you get" section rewritten around policies.
+
+/Done when:/ =[notify.policies]= overrides per-stage behavior, invalid
+entries fail clearly, =tesla notify policies= lists defaults, overrides
+and allowed values, configs without policies behave exactly as before,
+a real =tesla notify test= and an auto-charge run with a configured
+topic deliver the expected stages (carried over from M7), and
+=uv run ruff check .=, =uv run ruff format --check .= and
+=uv run pytest -q= are green.
 
 /See:/ [[*Configuration and tokens]], [[*Core flow: auto-charge]], [[*CLI surface (v0.1)]].
 
@@ -607,7 +803,8 @@ dry-run/real run.
 - Local control: BLE for the car, =aiopowerwall=/TEDAPI for the gateway.
 - Multiple vehicles/sites with per-entity config.
 - Notifications: Home Assistant, e-mail (ntfy delivered in M7).
-- Hysteresis: stop charging when the Powerwall drops below a floor.
+- Hysteresis: stop charging when the Powerwall drops below a floor
+  (specified as the CoS gate in M8).
 - =--json= output on status commands for scripting.
 - Tariff-aware windows using =get_tariff_periods()=.
 - Historical energy/charge queries and a small web UI.

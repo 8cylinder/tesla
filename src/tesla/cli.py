@@ -29,7 +29,15 @@ from .auto_charge import (
     TeslaAutoChargeClient,
 )
 from .auto_charge import run as run_auto_charge
-from .car import charge_state, is_plugged
+from .car import (
+    ChargeOnSolarSettings,
+    charge_state,
+    is_plugged,
+    vehicle_status,
+)
+from .car import (
+    charge_on_solar_settings as read_cos_settings,
+)
 from .client import (
     HOSTED_KEY_PATH,
     SCOPES,
@@ -407,7 +415,7 @@ def powerwall_status(watch: bool, interval: int) -> None:
             console.print("stopped")
 
 
-def _render_car(data: dict) -> None:
+def _render_car(data: dict, settings: ChargeOnSolarSettings | None = None) -> None:
     state = charge_state(data)
     if state is None:
         _fail("vehicle did not return charge state (asleep or offline?)", 3)
@@ -426,6 +434,23 @@ def _render_car(data: dict) -> None:
     table.add_row("Plugged in", plugged_text)
     limit = state.get("charge_limit_soc")
     table.add_row("Charge limit", f"{limit}%" if limit is not None else "unavailable")
+    status = vehicle_status(data)
+    if settings is None:
+        cos_text = "unknown"
+    else:
+        cos_text = "enabled" if settings.enabled else "disabled"
+    table.add_row("Charge on solar", cos_text)
+    if status.cos_state:
+        detail = status.cos_state
+        if status.cos_reason:
+            detail += f" ({status.cos_reason})"
+        table.add_row("CoS state", detail)
+    if settings is not None and (
+        settings.lower_limit is not None or settings.upper_limit is not None
+    ):
+        lower = "?" if settings.lower_limit is None else f"{settings.lower_limit:g}"
+        upper = "?" if settings.upper_limit is None else f"{settings.upper_limit:g}"
+        table.add_row("CoS limits", f"{lower}% to {upper}%")
     console.print(table)
 
 
@@ -436,7 +461,7 @@ def car() -> None:
 
 @car.command("status")
 def car_status() -> None:
-    """Show battery, charging state, plug status, and charge limit."""
+    """Show battery, charging state, plug status, charge limit, and CoS."""
     with _api_errors():
         config = load_config()
         vin = config.vehicle.vin
@@ -447,16 +472,25 @@ def car_status() -> None:
         if stored is None:
             _fail("not logged in; run 'tesla auth login'")
 
-        async def run() -> dict:
+        async def run() -> tuple[dict, ChargeOnSolarSettings | None]:
             async with oauth_client(
                 credentials=credentials, config=config, stored=stored
             ) as oauth:
                 await ensure_fresh_token(oauth)
                 vehicle = oauth.vehicles.createFleet(vin)
-                return await vehicle.vehicle_data(endpoints=["charge_state"])
+                data = await vehicle.vehicle_data(endpoints=["charge_state"])
+                settings = None
+                if config.vehicle.command_mode == "signed":
+                    await oauth.get_private_key(str(key_path(config)))
+                    signed = oauth.vehicles.createSigned(vin)
+                    try:
+                        settings = read_cos_settings(await signed.get_charge_on_solar())
+                    except TeslaFleetError:
+                        settings = None
+                return data, settings
 
-        data = asyncio.run(run())
-    _render_car(data)
+        data, settings = asyncio.run(run())
+    _render_car(data, settings)
 
 
 def _car_context() -> tuple[Config, Credentials, Tokens]:
