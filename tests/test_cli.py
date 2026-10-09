@@ -1,9 +1,13 @@
+import contextlib
 import stat
+from datetime import datetime
 
+import pytest
 from click.testing import CliRunner
+from tesla_fleet_api.exceptions import VehicleOffline
 
 from tesla import __version__
-from tesla.cli import cli
+from tesla.cli import _estimate_eta, _format_clock_time, _notify_on_level, cli
 from tesla.tokens import Tokens, load_tokens, save_tokens
 
 
@@ -158,6 +162,193 @@ def test_powerwall_status_without_tokens_exits_2(config_dir):
     assert "tesla auth login" in combined(result)
 
 
+def test_powerwall_notify_without_site_id_exits_2(config_dir):
+    result = invoke(config_dir, "powerwall", "notify")
+    assert result.exit_code == 2
+    assert "energy_site_id" in combined(result)
+
+
+def test_powerwall_notify_disabled_exits_2(config_dir):
+    assert (
+        invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123").exit_code
+        == 0
+    )
+    result = invoke(config_dir, "powerwall", "notify")
+    assert result.exit_code == 2
+    assert "disabled" in combined(result)
+
+
+def test_powerwall_notify_missing_topic_exits_2(config_dir, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert (
+        invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123").exit_code
+        == 0
+    )
+    assert invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code == 0
+    monkeypatch.delenv("TESLA_NTFY_TOPIC", raising=False)
+    result = invoke(config_dir, "powerwall", "notify")
+    assert result.exit_code == 2
+    assert "TESLA_NTFY_TOPIC" in combined(result)
+
+
+def test_powerwall_notify_without_tokens_exits_2(config_dir):
+    assert (
+        invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123").exit_code
+        == 0
+    )
+    assert invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code == 0
+    result = invoke(
+        config_dir, "powerwall", "notify", env={"TESLA_NTFY_TOPIC": "test-topic"}
+    )
+    assert result.exit_code == 2
+    assert "tesla auth login" in combined(result)
+
+
+class _SourceExhausted(Exception):
+    pass
+
+
+def level_source(values):
+    pending = list(values)
+
+    async def source():
+        if not pending:
+            raise _SourceExhausted
+        return pending.pop(0)
+
+    return source
+
+
+class FakeLevelNotifier:
+    def __init__(self, result=True):
+        self.result = result
+        self.sent = []
+
+    async def send(self, stage, message, **kwargs):
+        self.sent.append((stage, message))
+        return self.result
+
+
+async def _no_sleep(_seconds):
+    return None
+
+
+async def test_notify_on_level_sends_once_per_cycle():
+    notifier = FakeLevelNotifier()
+    with pytest.raises(_SourceExhausted):
+        await _notify_on_level(
+            notifier,
+            level_source([50.0, 100.0, 100.0, 99.0, 100.0]),
+            level=100.0,
+            interval=1,
+            sleep=_no_sleep,
+        )
+    assert [message for _, message in notifier.sent] == [
+        "Powerwall reached 100%",
+        "Powerwall reached 100%",
+    ]
+
+
+async def test_notify_on_level_never_sends_below_level():
+    notifier = FakeLevelNotifier()
+    with pytest.raises(_SourceExhausted):
+        await _notify_on_level(
+            notifier,
+            level_source([10.0, 50.0, 99.9]),
+            level=100.0,
+            interval=1,
+            sleep=_no_sleep,
+        )
+    assert notifier.sent == []
+
+
+async def test_notify_on_level_ignores_unavailable_readings():
+    notifier = FakeLevelNotifier()
+    with pytest.raises(_SourceExhausted):
+        await _notify_on_level(
+            notifier,
+            level_source([None, 100.0, None]),
+            level=100.0,
+            interval=1,
+            sleep=_no_sleep,
+        )
+    assert len(notifier.sent) == 1
+
+
+async def test_notify_on_level_retries_failed_send():
+    notifier = FakeLevelNotifier(result=False)
+    with pytest.raises(_SourceExhausted):
+        await _notify_on_level(
+            notifier,
+            level_source([100.0, 100.0]),
+            level=90.0,
+            interval=1,
+            sleep=_no_sleep,
+        )
+    assert len(notifier.sent) == 2
+
+
+def test_estimate_eta_linear():
+    history = [(0.0, 50.0), (300.0, 51.0), (600.0, 52.0)]
+    assert _estimate_eta(history, 90.0) == pytest.approx(12000.0)
+    assert _estimate_eta(history, 52.0) is None
+    assert _estimate_eta(history, 51.0) is None
+
+
+def test_estimate_eta_needs_rise():
+    assert _estimate_eta([], 90.0) is None
+    assert _estimate_eta([(0.0, 50.0)], 90.0) is None
+    assert _estimate_eta([(0.0, 60.0), (300.0, 59.0)], 90.0) is None
+    assert _estimate_eta([(0.0, 50.0), (300.0, 50.0)], 90.0) is None
+
+
+@pytest.mark.parametrize(
+    ("moment", "expected"),
+    [
+        (datetime(2026, 10, 9, 13, 10), "1:10pm"),
+        (datetime(2026, 10, 9, 1, 5), "1:05am"),
+        (datetime(2026, 10, 9, 0, 5), "12:05am"),
+        (datetime(2026, 10, 9, 12, 0), "12:00pm"),
+    ],
+)
+def test_format_clock_time(moment, expected):
+    assert _format_clock_time(moment.timestamp()) == expected
+
+
+async def test_notify_on_level_logs_eta(caplog):
+    notifier = FakeLevelNotifier()
+    now = 1_000_000.0
+    pending = [50.0, 51.0, 52.0]
+
+    async def source():
+        if not pending:
+            raise _SourceExhausted
+        return pending.pop(0)
+
+    def clock():
+        return now
+
+    async def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    with (
+        caplog.at_level("INFO", logger="tesla.cli"),
+        pytest.raises(_SourceExhausted),
+    ):
+        await _notify_on_level(
+            notifier,
+            source,
+            level=90.0,
+            interval=300,
+            sleep=sleep,
+            clock=clock,
+        )
+    messages = [record.getMessage() for record in caplog.records]
+    eta = _format_clock_time(1_012_000.0)
+    assert f"waiting for 90%; eta: {eta}" in messages[-1]
+
+
 def test_car_status_without_vin_exits_2(config_dir):
     result = invoke(config_dir, "car", "status")
     assert result.exit_code == 2
@@ -170,6 +361,108 @@ def test_car_status_without_tokens_exits_2(config_dir):
     result = invoke(config_dir, "car", "status")
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
+
+
+class FakeVehicle:
+    def __init__(self, results):
+        self.results = list(results)
+        self.wakes = 0
+        self.wake_timeouts = []
+
+    async def vehicle_data(self, endpoints=None):
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    async def wake_up(self, wait=False, timeout=None):
+        self.wakes += 1
+        self.wake_timeouts.append(timeout)
+        return {"response": {"state": "online"}}
+
+
+class FakeVehicles:
+    def __init__(self, vehicle):
+        self._vehicle = vehicle
+
+    def createFleet(self, vin):
+        return self._vehicle
+
+
+class FakeOAuth:
+    def __init__(self, vehicle):
+        self.vehicles = FakeVehicles(vehicle)
+
+    async def check_access_token(self):
+        return None
+
+
+CAR_DATA = {
+    "response": {
+        "charge_state": {
+            "battery_level": 55,
+            "battery_range": 180.5,
+            "charging_state": "Stopped",
+            "charge_limit_soc": 80,
+        }
+    }
+}
+
+
+def patch_oauth(monkeypatch, vehicle):
+    @contextlib.asynccontextmanager
+    async def fake_oauth_client(**kwargs):
+        yield FakeOAuth(vehicle)
+
+    monkeypatch.setattr("tesla.cli.oauth_client", fake_oauth_client)
+
+
+def car_status_env():
+    return {
+        "TESLA_CLIENT_ID": "id",
+        "TESLA_CLIENT_SECRET": "secret",
+        "TESLA_REDIRECT_URI": "http://localhost:8085/callback",
+    }
+
+
+def prepare_car_status(config_dir, wake_timeout=None):
+    assert invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code == 0
+    assert (
+        invoke(config_dir, "config", "set", "vehicle.command_mode", "fleet").exit_code
+        == 0
+    )
+    if wake_timeout is not None:
+        result = invoke(
+            config_dir,
+            "config",
+            "set",
+            "auto_charge.wake_timeout_seconds",
+            str(wake_timeout),
+        )
+        assert result.exit_code == 0
+    save_tokens(Tokens("refresh", 9999999999))
+
+
+def test_car_status_wakes_asleep_vehicle(config_dir, monkeypatch):
+    prepare_car_status(config_dir, wake_timeout=120)
+    vehicle = FakeVehicle([VehicleOffline(), CAR_DATA])
+    patch_oauth(monkeypatch, vehicle)
+    result = invoke(config_dir, "car", "status", env=car_status_env())
+    assert result.exit_code == 0
+    assert "waking car" in combined(result)
+    assert vehicle.wakes == 1
+    assert vehicle.wake_timeouts == [120]
+    assert "55%" in result.output
+
+
+def test_car_status_does_not_wake_awake_vehicle(config_dir, monkeypatch):
+    prepare_car_status(config_dir)
+    vehicle = FakeVehicle([CAR_DATA])
+    patch_oauth(monkeypatch, vehicle)
+    result = invoke(config_dir, "car", "status", env=car_status_env())
+    assert result.exit_code == 0
+    assert vehicle.wakes == 0
+    assert "55%" in result.output
 
 
 def test_auto_charge_without_vin_exits_2(config_dir):
