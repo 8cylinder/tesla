@@ -307,7 +307,8 @@ use `Restart=always` with `RestartSec=300` or prefer the timer.
 | `tesla auth logout`                          | Delete the local token (does not revoke it)        |
 | `tesla products`                             | List vehicles and energy sites with IDs            |
 | `tesla powerwall status [--watch]`           | Battery %, reserve, grid status                    |
-| `tesla car status`                           | Battery, range, charging state, plug, charge limit |
+| `tesla powerwall notify [--level N]`         | Notify once per cycle when the battery reaches N%  |
+| `tesla car status`                           | Battery, range, charging state, plug, charge limit (wakes if asleep) |
 | `tesla car charge start` / `stop`            | Start/stop charging (wakes the car)                |
 | `tesla car charge limit <pct>`               | Set the charge limit (0–100)                       |
 | `tesla auto-charge [flags]`                  | Watch the Powerwall and trigger once               |
@@ -411,6 +412,24 @@ auto-charge stage and after manual charging commands.
    uv run tesla config set notify.enabled true
    uv run tesla notify test
    ```
+
+### Powerwall level watch
+
+`tesla powerwall notify [--level N]` watches the battery level and sends
+one notification each charge cycle when it reaches N% (default 100). It
+does not re-arm until the level drops below N, so leaving it running as
+a service produces a single push per cycle. `--level`/`-l` accepts a
+percentage in (0, 100], and `--interval` (default 300 s) sets the poll
+rate. The latch is in memory, so a process restart re-arms it.
+
+While waiting, each poll logs a straight-line projection of when the
+level will be reached (`eta: 1:10pm`) fitted over the last five
+readings; it is omitted while the level is flat or falling. Treat it as
+a rough estimate, since solar charging rarely holds a steady rate.
+
+```shell
+uv run tesla powerwall notify --level 90
+```
 
 ### What gets sent
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from tesla_fleet_api.exceptions import (
     LoginRequired,
     OAuthExpired,
     TeslaFleetError,
+    VehicleOffline,
 )
 
 from . import __version__
@@ -77,6 +79,7 @@ from .tokens import TokenError, Tokens, load_tokens
 
 console = Console()
 err_console = Console(stderr=True)
+LOGGER = logging.getLogger(__name__)
 
 _AUTH_FAULTS = (OAuthExpired, InvalidToken, LoginRequired)
 
@@ -370,7 +373,82 @@ def _render_powerwall(live: dict, info: dict | None = None) -> None:
 
 @cli.group()
 def powerwall() -> None:
-    """Powerwall status."""
+    """Powerwall status and notifications."""
+
+
+_ETA_WINDOW = 5
+
+
+def _format_clock_time(timestamp: float) -> str:
+    """Render a local time as e.g. ``1:10pm``."""
+    moment = datetime.fromtimestamp(timestamp)
+    hour = moment.hour % 12 or 12
+    meridiem = "am" if moment.hour < 12 else "pm"
+    return f"{hour}:{moment.minute:02d}{meridiem}"
+
+
+def _estimate_eta(history: list[tuple[float, float]], level: float) -> float | None:
+    """Least-squares extrapolation to ``level``; None when not rising."""
+    if len(history) < 2:
+        return None
+    last_t, last_pct = history[-1]
+    if last_pct >= level:
+        return None
+    mean_t = sum(t for t, _ in history) / len(history)
+    mean_pct = sum(pct for _, pct in history) / len(history)
+    variance = sum((t - mean_t) ** 2 for t, _ in history)
+    if variance == 0:
+        return None
+    slope = sum((t - mean_t) * (pct - mean_pct) for t, pct in history) / variance
+    if slope <= 0:
+        return None
+    return last_t + (level - last_pct) / slope
+
+
+async def _notify_on_level(
+    notifier,
+    read_pct,
+    *,
+    level: float,
+    interval: float,
+    sleep=None,
+    clock=None,
+) -> None:
+    """Poll the level and notify once per crossing of ``level``."""
+    sleep = sleep or asyncio.sleep
+    clock = clock or time.time
+    history: list[tuple[float, float]] = []
+    notified = False
+    while True:
+        pct = await read_pct()
+        if pct is None:
+            LOGGER.info("Powerwall reading unavailable")
+        else:
+            history.append((clock(), pct))
+            history = history[-_ETA_WINDOW:]
+            if pct >= level:
+                if not notified:
+                    LOGGER.info("Powerwall reached %g%%; sending notification", level)
+                    notified = await notifier.send(
+                        "powerwall_level",
+                        f"Powerwall reached {level:g}%",
+                        tags=("battery",),
+                    )
+                else:
+                    LOGGER.info("Powerwall at %.1f%%; already notified", pct)
+            else:
+                eta = _estimate_eta(history, level)
+                eta_text = f"; eta: {_format_clock_time(eta)}" if eta else ""
+                if notified:
+                    LOGGER.info(
+                        "Powerwall dropped to %.1f%%; notification re-armed", pct
+                    )
+                else:
+                    LOGGER.info(
+                        "Powerwall at %.1f%%; waiting for %g%%%s", pct, level, eta_text
+                    )
+                notified = False
+        await sleep(interval)
 
 
 @powerwall.command("status")
@@ -408,6 +486,68 @@ def powerwall_status(watch: bool, interval: int) -> None:
                     if not watch:
                         return
                     await asyncio.sleep(interval)
+
+        try:
+            asyncio.run(run())
+        except KeyboardInterrupt:
+            console.print("stopped")
+
+
+@powerwall.command("notify")
+@click.option(
+    "--level",
+    "-l",
+    type=click.FloatRange(0.0, 100.0, min_open=True),
+    default=100.0,
+    show_default=True,
+    help="Notify when the battery reaches this percentage.",
+)
+@click.option(
+    "--interval",
+    type=click.IntRange(min=5),
+    default=300,
+    show_default=True,
+    help="Seconds between polls.",
+)
+def powerwall_notify(level: float, interval: int) -> None:
+    """Watch the Powerwall and notify once per cycle at LEVEL%."""
+    logging.getLogger("tesla.cli").setLevel(logging.INFO)
+    with _api_errors():
+        config = load_config()
+        site_id = config.powerwall.energy_site_id
+        if site_id is None:
+            _fail(
+                "no energy_site_id set; run "
+                "'tesla config set powerwall.energy_site_id <id>'"
+            )
+        if not config.notify.enabled:
+            _fail(
+                "notifications are disabled; run 'tesla config set notify.enabled true'"
+            )
+        try:
+            notifier = build_notifier(config)
+        except NotifyError as exc:
+            _fail(str(exc))
+        if notifier is None:  # pragma: no cover - enabled checked above
+            _fail("notifications are disabled")
+        credentials = load_credentials()
+        stored = load_tokens()
+        if stored is None:
+            _fail("not logged in; run 'tesla auth login'")
+
+        async def run() -> None:
+            async with oauth_client(
+                credentials=credentials, config=config, stored=stored
+            ) as oauth:
+                site = oauth.energySites.create(site_id)
+
+                async def read_pct() -> float | None:
+                    await ensure_fresh_token(oauth)
+                    return percentage_charged(await site.live_status())
+
+                await _notify_on_level(
+                    notifier, read_pct, level=level, interval=interval
+                )
 
         try:
             asyncio.run(run())
@@ -454,6 +594,18 @@ def _render_car(data: dict, settings: ChargeOnSolarSettings | None = None) -> No
     console.print(table)
 
 
+async def _read_car_data(vehicle, config: Config) -> dict:
+    """Read charge state, waking the vehicle once when it is asleep."""
+    try:
+        return await vehicle.vehicle_data(endpoints=["charge_state"])
+    except VehicleOffline:
+        LOGGER.info("vehicle asleep; waking car to read status")
+        await vehicle.wake_up(
+            wait=True, timeout=config.auto_charge.wake_timeout_seconds
+        )
+        return await vehicle.vehicle_data(endpoints=["charge_state"])
+
+
 @cli.group()
 def car() -> None:
     """Vehicle status and charging commands."""
@@ -462,6 +614,7 @@ def car() -> None:
 @car.command("status")
 def car_status() -> None:
     """Show battery, charging state, plug status, charge limit, and CoS."""
+    logging.getLogger("tesla.cli").setLevel(logging.INFO)
     with _api_errors():
         config = load_config()
         vin = config.vehicle.vin
@@ -478,7 +631,7 @@ def car_status() -> None:
             ) as oauth:
                 await ensure_fresh_token(oauth)
                 vehicle = oauth.vehicles.createFleet(vin)
-                data = await vehicle.vehicle_data(endpoints=["charge_state"])
+                data = await _read_car_data(vehicle, config)
                 settings = None
                 if config.vehicle.command_mode == "signed":
                     await oauth.get_private_key(str(key_path(config)))
