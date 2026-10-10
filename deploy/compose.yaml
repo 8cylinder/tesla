@@ -1,0 +1,23 @@
+services:
+  tesla:
+    image: tesla-app:${TESLA_TAG:-latest}
+    container_name: tesla-app
+    init: true
+    restart: unless-stopped
+    user: "${TESLA_UID:-1000}:${TESLA_GID:-1000}"
+    environment:
+      TESLA_CONFIG_DIR: /config
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./config:/config
+    # Override the default notify level/interval here:
+    # command: ["powerwall", "notify", "--level", "95", "--interval", "300"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+    # Uncomment when the web UI lands; follow the server's
+    # servername.local:port convention used by the other apps.
+    # ports:
+    #   - "8765:8765"
