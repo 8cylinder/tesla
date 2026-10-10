@@ -377,6 +377,7 @@ def powerwall() -> None:
 
 
 _ETA_WINDOW = 5
+_IDLE_INTERVAL = 3600.0
 
 
 def _format_clock_time(timestamp: float) -> str:
@@ -414,19 +415,24 @@ async def _notify_on_level(
     sleep=None,
     clock=None,
 ) -> None:
-    """Poll the level and notify once per crossing of ``level``."""
+    """Poll the level and notify once per crossing of ``level``.
+
+    After the notification, polling slows to once an hour until the level
+    dips below again, when the normal interval and ETA history resume.
+    """
     sleep = sleep or asyncio.sleep
     clock = clock or time.time
+    idle_interval = max(interval, _IDLE_INTERVAL)
     history: list[tuple[float, float]] = []
     notified = False
+    poll_interval = interval
     while True:
         pct = await read_pct()
         if pct is None:
             LOGGER.info("Powerwall reading unavailable")
         else:
-            history.append((clock(), pct))
-            history = history[-_ETA_WINDOW:]
             if pct >= level:
+                history.clear()
                 if not notified:
                     LOGGER.info("Powerwall reached %g%%; sending notification", level)
                     notified = await notifier.send(
@@ -437,6 +443,8 @@ async def _notify_on_level(
                 else:
                     LOGGER.info("Powerwall at %.1f%%; already notified", pct)
             else:
+                history.append((clock(), pct))
+                history = history[-_ETA_WINDOW:]
                 eta = _estimate_eta(history, level)
                 eta_text = f"; eta: {_format_clock_time(eta)}" if eta else ""
                 if notified:
@@ -448,7 +456,17 @@ async def _notify_on_level(
                         "Powerwall at %.1f%%; waiting for %g%%%s", pct, level, eta_text
                     )
                 notified = False
-        await sleep(interval)
+        next_interval = idle_interval if notified else interval
+        if next_interval != poll_interval:
+            if next_interval > poll_interval:
+                LOGGER.info(
+                    "poll interval slowed to %.0f s until the next cycle",
+                    next_interval,
+                )
+            else:
+                LOGGER.info("poll interval back to %.0f s", next_interval)
+            poll_interval = next_interval
+        await sleep(poll_interval)
 
 
 @powerwall.command("status")

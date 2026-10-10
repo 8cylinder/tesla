@@ -427,6 +427,11 @@ level will be reached (`eta: 1:10pm`) fitted over the last five
 readings; it is omitted while the level is flat or falling. Treat it as
 a rough estimate, since solar charging rarely holds a steady rate.
 
+After the notification, polling slows to once an hour until the level
+drops below N again. The normal `--interval` rate then resumes and the
+ETA is recalculated from fresh readings, so the next cycle is watched
+in full.
+
 ```shell
 uv run tesla powerwall notify --level 90
 ```
