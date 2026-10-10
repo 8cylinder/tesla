@@ -288,6 +288,76 @@ async def test_notify_on_level_retries_failed_send():
     assert len(notifier.sent) == 2
 
 
+async def test_notify_on_level_polls_hourly_after_notification():
+    notifier = FakeLevelNotifier()
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    with pytest.raises(_SourceExhausted):
+        await _notify_on_level(
+            notifier,
+            level_source([50.0, 100.0, 100.0, 99.0]),
+            level=100.0,
+            interval=300,
+            sleep=sleep,
+        )
+    assert sleeps == [300, 3600, 3600, 300]
+
+
+async def test_notify_on_level_logs_poll_interval_changes(caplog):
+    notifier = FakeLevelNotifier()
+    with (
+        caplog.at_level("INFO", logger="tesla.cli"),
+        pytest.raises(_SourceExhausted),
+    ):
+        await _notify_on_level(
+            notifier,
+            level_source([50.0, 100.0, 99.0]),
+            level=100.0,
+            interval=300,
+            sleep=_no_sleep,
+        )
+    messages = [record.getMessage() for record in caplog.records]
+    assert "poll interval slowed to 3600 s until the next cycle" in messages
+    assert "poll interval back to 300 s" in messages
+
+
+async def test_notify_on_level_recalculates_eta_after_new_cycle(caplog):
+    notifier = FakeLevelNotifier()
+    now = 1_000_000.0
+    pending = [50.0, 51.0, 90.0, 50.0, 51.0, 52.0]
+
+    async def source():
+        if not pending:
+            raise _SourceExhausted
+        return pending.pop(0)
+
+    def clock():
+        return now
+
+    async def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    with (
+        caplog.at_level("INFO", logger="tesla.cli"),
+        pytest.raises(_SourceExhausted),
+    ):
+        await _notify_on_level(
+            notifier,
+            source,
+            level=90.0,
+            interval=300,
+            sleep=sleep,
+            clock=clock,
+        )
+    messages = [record.getMessage() for record in caplog.records]
+    eta = _format_clock_time(1_016_200.0)
+    assert f"waiting for 90%; eta: {eta}" in messages[-1]
+
+
 def test_estimate_eta_linear():
     history = [(0.0, 50.0), (300.0, 51.0), (600.0, 52.0)]
     assert _estimate_eta(history, 90.0) == pytest.approx(12000.0)
