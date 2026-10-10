@@ -195,6 +195,104 @@ token.
 
 ## 7. Deploy to a home network server
 
+The primary deployment is a private Docker image. It is built on the dev
+machine, shipped to the server as a compressed tar, and run with Compose;
+state and secrets stay in a host directory, so the image contains only
+code and dependencies and nothing is ever published to a registry. The
+systemd + uv alternative is
+[described below](#alternative-systemd--uv).
+
+### Docker deployment
+
+The image is tagged `tesla-app:<version>-<git-sha>`. `scripts/deploy.sh`
+builds it, saves it to `dist/`, copies it to the server, loads it, and
+restarts the service. The server needs only Docker with Compose and the
+host needs `docker`, `ssh`, `scp`, `gzip`, `uv`, and `git` (on Windows,
+run the script from WSL or Git Bash).
+
+On the server the deployment directory looks like:
+
+```text
+~/tesla/
+├── compose.yaml        # copied by the deploy script
+├── .env                # TESLA_TAG, TESLA_UID/GID, TZ (written by the script)
+├── backup.sh           # copied by the deploy script
+├── config/             # state and secrets (mode 700; files 600)
+├── images/             # shipped image tars (current + previous kept)
+└── backups/            # state archives from backup.sh
+```
+
+#### First deploy
+
+1. Ship the image and create the directories:
+
+   ```sh
+   TESLA_SERVER=<ssh-host> scripts/deploy.sh
+   ```
+
+   The container starts but exits until `config/` has credentials; that
+   is expected.
+
+2. Copy state from the machine where you authorized:
+
+   ```sh
+   scp ~/.config/tesla/config.toml ~/.config/tesla/tokens.json \
+       ~/.config/tesla/private_key.pem <ssh-host>:tesla/config/
+   scp .env <ssh-host>:tesla/config/          # client id/secret + ntfy topic
+   ssh <ssh-host> 'chmod 600 ~/tesla/config/*'
+   ```
+
+3. Restart and verify:
+
+   ```sh
+   ssh <ssh-host> 'cd ~/tesla && docker compose restart'
+   ssh <ssh-host> 'cd ~/tesla && docker compose exec tesla tesla doctor'
+   ssh <ssh-host> 'docker logs -f tesla-app'
+   ```
+
+   The log should show the `Powerwall at N%; waiting for N%` lines,
+   including the ETA once there are two readings.
+
+#### Update and roll back
+
+```sh
+TESLA_SERVER=<ssh-host> scripts/deploy.sh
+```
+
+Each deploy keeps the previous image and tar; the script prints the
+one-line rollback (point `TESLA_TAG` back at the previous tag in
+`~/tesla/.env` and `docker compose up -d`).
+
+#### Logs
+
+The container logs to Docker's `json-file` driver, capped at 5 MB times 3
+files, and never needs a mount: `docker logs --since 7d tesla-app`. Logs
+belong to the container, so they reset when it is recreated.
+
+#### Backups
+
+`deploy/backup.sh` archives `config/` into `backups/` and keeps the
+newest eight. Add it to the server crontab:
+
+```cron
+0 4 * * 0 $HOME/tesla/backup.sh
+```
+
+The private key is the irreplaceable file; `tokens.json` can be re-fetched
+with `tesla auth login`. To restore: `docker compose down`, unpack an
+archive into `~/tesla/`, restore the file modes, and `docker compose up
+-d`.
+
+#### Notes
+
+- Secrets are never baked into the image (`TESLA_CONFIG_DIR=/config`
+  points at the host directory), so the tar holds only private code.
+- The tar is architecture-specific (x86_64 today).
+- When the web UI lands, uncomment `ports:` in `compose.yaml` and pick a
+  free port following the server's `servername.local:port` convention.
+
+### Alternative: systemd + uv
+
 The CLI and its state are small: install uv, copy the project and state,
 install the CLI, then schedule it.
 
