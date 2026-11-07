@@ -292,9 +292,50 @@ one-line rollback (point `TESLA_TAG` back at the previous tag in
 
 #### Logs
 
-The container logs to Docker's `json-file` driver, capped at 5 MB times 3
-files, and never needs a mount: `docker logs --since 7d tesla-app`. Logs
-belong to the container, so they reset when it is recreated.
+`powerwall notify` logs to stdout/stderr, and Docker captures it with the
+`json-file` driver. Follow the output live:
+
+```sh
+ssh <ssh-host> 'docker logs -f --tail 50 tesla-app'
+```
+
+Or use Compose from the deployment directory:
+
+```sh
+ssh <ssh-host> 'cd ~/tesla && docker compose logs -f --tail 50 tesla'
+```
+
+View recent history without following:
+
+```sh
+ssh <ssh-host> 'docker logs --tail 200 tesla-app'
+ssh <ssh-host> 'docker logs --since 24h tesla-app'
+ssh <ssh-host> 'docker logs --since 2026-11-07T00:00:00 tesla-app'
+```
+
+Add `--timestamps` for Docker's timestamps in addition to the app's own
+timestamps, and filter as usual:
+
+```sh
+ssh <ssh-host> 'docker logs --timestamps --tail 50 tesla-app'
+ssh <ssh-host> 'docker logs tesla-app 2>&1 | grep "Powerwall at"'
+```
+
+The watcher logs one `Powerwall at N%; waiting for N%` line per poll
+(about every five minutes by default), plus stage changes and errors.
+
+Docker rotates the logs using `max-size: 5m` and `max-file: 3` from
+`compose.yaml`: at most three files, about 15 MB total. The oldest file is
+deleted when a new one is created; rotated files are not gzipped.
+`docker logs` reads the retained files, so `--since`/`--tail` work until
+data falls off the oldest one.
+
+Logs belong to the container, not the mounted `config/` volume. A
+`docker compose restart` keeps them, but `deploy.sh` recreates the
+container for a new image and the old logs are lost. To keep more
+history, raise `max-size`/`max-file` in `deploy/compose.yaml`, or use
+`--log-file /config/tesla.log` in the Compose command plus host
+`logrotate`.
 
 #### Backups
 
