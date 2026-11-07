@@ -41,8 +41,8 @@ web UI.
 | CLI framework     | Click                                                                                                                                                                                                  |
 | Poll interval     | 300 s default, configurable                                                                                                                                                                            |
 | Backoff           | 5 s initial, x2, cap 300 s, +/-20% jitter, give up after 5 consecutive failures                                                                                                                        |
-| Distribution name | =tesla= (project, module, executable); user decision in M1 --- no rename to =tesla-cli=                                                                                                                  |
-| Notifications     | ntfy.sh (self-hosted URL supported); topic/token from env/.env; event-driven with persisted cooldowns                                                                                                     |
+| Distribution name | =tesla= (project, module, executable); user decision in M1 --- no rename to =tesla-cli=                                                                                                                    |
+| Notifications     | ntfy.sh (self-hosted URL supported); topic/token from env/.env; event-driven with persisted cooldowns                                                                                                  |
 | Error handling    | Catch =TeslaFleetError= explicitly --- it subclasses =BaseException=, not =Exception=                                                                                                                        |
 
 * Tesla developer app (one-time setup)
@@ -323,8 +323,8 @@ on_start = true               # report current state on start/restart
 require_plugged)= is a pure function; the loop only performs the returned
 action.
 
-| PW reading   | charging_state      | require_plugged | Action               |
-|--------------+---------------------+-----------------+----------------------|
+| PW reading   | charging_state      | require_plugged | Action             |
+|--------------+---------------------+-----------------+--------------------|
 | >= threshold | Charging / Complete | any             | =DONE= (exit 0)      |
 | >= threshold | Disconnected        | true            | =WAIT_PLUG=          |
 | >= threshold | Disconnected        | false           | =START= (attempt)    |
@@ -625,24 +625,24 @@ CoS setting from the CLI; it only reads it.
   =update_charge_on_solar=.
 
 *Loop behavior (priority order, first match wins):*
-| Condition                                      | Action            |
-|------------------------------------------------+-------------------|
-| CoS disabled                                   | WAIT + alert      |
-| Disconnected                                   | IDLE              |
-| Complete / SOC >= CoS upper limit              | IDLE              |
-| =charging_on_anything= (grid/Powerwall)        | STOP + alert      |
-| Charging/Starting, PW < 90                     | STOP (latch)      |
-| Charging/Starting, PW >= 90                    | IDLE              |
-| =no_charge_recommended= + =POWERWALL_CHARGE_PRIORITY= | IDLE       |
-| =no_charge_recommended= (other), PW < 90       | STOP (latch)      |
-| =no_charge_recommended= (other), PW >= 90      | IDLE (CoS resumes) |
-| =waiting_for_server=, PW < 90                  | STOP              |
-| =waiting_for_server=, PW >= 90                 | IDLE              |
-| =user_stopped=, PW >= 95                       | START             |
-| Stopped/NoPower, PW >= 95, SOC < CoS lower     | WAIT + alert      |
-| Stopped/NoPower, PW >= 95                      | START             |
-| Stopped/NoPower, PW < 95                       | IDLE              |
-| Asleep / unknown                               | WAIT              |
+| Condition                                         | Action             |
+|---------------------------------------------------+--------------------|
+| CoS disabled                                      | WAIT + alert       |
+| Disconnected                                      | IDLE               |
+| Complete / SOC >= CoS upper limit                 | IDLE               |
+| =charging_on_anything= (grid/Powerwall)             | STOP + alert       |
+| Charging/Starting, PW < 90                        | STOP (latch)       |
+| Charging/Starting, PW >= 90                       | IDLE               |
+| =no_charge_recommended= + =POWERWALL_CHARGE_PRIORITY= | IDLE               |
+| =no_charge_recommended= (other), PW < 90            | STOP (latch)       |
+| =no_charge_recommended= (other), PW >= 90           | IDLE (CoS resumes) |
+| =waiting_for_server=, PW < 90                       | STOP               |
+| =waiting_for_server=, PW >= 90                      | IDLE               |
+| =user_stopped=, PW >= 95                            | START              |
+| Stopped/NoPower, PW >= 95, SOC < CoS lower        | WAIT + alert       |
+| Stopped/NoPower, PW >= 95                         | START              |
+| Stopped/NoPower, PW < 95                          | IDLE               |
+| Asleep / unknown                                  | WAIT               |
 
 *CoS state source:*
 - Live state is

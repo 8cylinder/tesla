@@ -57,7 +57,7 @@ the vehicle and Powerwall.
 3. Use these settings:
 
 | Field                | Value                                                                                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+|----------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
 | Registration type    | Just for me (personal account)                                                                                                             |
 | Application name     | anything, e.g. `HomeCLI`                                                                                                                   |
 | OAuth grant type     | **Authorization Code and Machine-to-Machine**                                                                                              |
@@ -81,17 +81,17 @@ included.
 1. Generate the EC P-256 key (written to
    `~/.config/tesla/private_key.pem`, mode 0600) and print the public
    half:
-   
+
    ```sh
    uv run tesla key generate --pem-only > /tmp/tesla-public-key.pem
    ```
 
 2. Upload that file to the domain from step 3, exactly at:
-   
+
    ```
    https://your-domain.example/.well-known/appspecific/com.tesla.3p.public-key.pem
    ```
-   
+
    It must be served over HTTPS, without redirects, byte-for-byte. Keep
    it online permanently — registration and vehicle pairing fetch it.
    The public host only serves this file; the private key stays on the
@@ -99,13 +99,13 @@ included.
 
 3. Set the domain and register the app with Tesla (uses the
    client-credentials grant):
-   
+
    ```sh
    uv run tesla config set domain your-domain.example
    uv run tesla key register
    uv run tesla key status
    ```
-   
+
    `key status` compares the local, Tesla-registered, and hosted keys. To
    use signed commands, pair the virtual key once per vehicle: open
    `https://tesla.com/_ak/your-domain.example` on a phone with the Tesla
@@ -222,7 +222,28 @@ On the server the deployment directory looks like:
 └── backups/            # state archives from backup.sh
 ```
 
-#### First deploy
+#### First deploy (bootstrap script)
+
+On the authenticated development machine, `scripts/deploy-initial.sh`
+automates the first-time setup: it runs the read-only preflight checks,
+validates `config.toml`, copies `config.toml`, `tokens.json`, the optional
+private key, and a minimal app `.env`, fixes ownership and modes, then
+calls `scripts/deploy.sh`.
+
+```sh
+TESLA_SERVER=sm@beelink.local scripts/deploy-initial.sh
+```
+
+It refuses to overwrite existing server state unless `--force` is given,
+supports `--dry-run`, and sends one remote ntfy test unless
+`--no-test-notify` is used. Use `scripts/deploy.sh` for later updates.
+
+Run `scripts/deploy-check.sh` first if you are unsure which path applies:
+its summary reports whether the server is not bootstrapped, partially
+bootstrapped, or already bootstrapped, and recommends `deploy-initial.sh`
+or `deploy.sh` accordingly.
+
+#### Manual first deploy
 
 1. Ship the image and create the directories:
 
@@ -238,7 +259,13 @@ On the server the deployment directory looks like:
    ```sh
    scp ~/.config/tesla/config.toml ~/.config/tesla/tokens.json \
        ~/.config/tesla/private_key.pem <ssh-host>:tesla/config/
-   scp .env <ssh-host>:tesla/config/          # client id/secret + ntfy topic
+
+   # Build a minimal app .env; do not copy SSH/SSH_SUDO keys.
+   grep -E '^(TESLA_CLIENT_ID|TESLA_CLIENT_SECRET|TESLA_REDIRECT_URI|TESLA_NTFY_TOPIC|TESLA_NTFY_TOKEN|TESLA_NTFY_URL)=' .env \
+       > /tmp/tesla-app.env
+   scp /tmp/tesla-app.env <ssh-host>:tesla/config/.env
+   rm /tmp/tesla-app.env
+
    ssh <ssh-host> 'chmod 600 ~/tesla/config/*'
    ```
 
@@ -333,7 +360,7 @@ All three options run the same command; the lock file keeps them from
 overlapping, so pick one and don't mix.
 
 | Option                                 | How it works                                            | Pros                                                                                                   | Cons                                                                                             |
-| -------------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+|----------------------------------------|---------------------------------------------------------|--------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
 | systemd timer + `--once` (recommended) | systemd launches `tesla auto-charge --once` every 5 min | No resident process; journald logs; survives reboot; cadence easy to change; no restart-semantics trap | Up to one interval of detection latency; process starts and refreshes the token each tick        |
 | systemd resident service               | systemd runs `tesla auto-charge` continuously           | Lowest latency; token refreshed only ~every 8 h; one process to watch                                  | Must use `Restart=always` to re-arm after a trigger; long-lived process; re-checks after success |
 | cron                                   | cron runs `tesla auto-charge --once` on a schedule      | Universally available; no systemd/linger; trivial to set up                                            | Minimal environment; DIY log redirection; no journald or hardening; no catch-up after downtime   |
@@ -398,23 +425,23 @@ use `Restart=always` with `RestartSec=300` or prefer the timer.
 
 ## Commands
 
-| Command                                      | Purpose                                            |
-| -------------------------------------------- | -------------------------------------------------- |
-| `tesla auth login [--listen]`                | Headless OAuth; saves the refresh token            |
-| `tesla auth status`                          | Token validity; refreshes and persists rotation    |
-| `tesla auth logout`                          | Delete the local token (does not revoke it)        |
-| `tesla products`                             | List vehicles and energy sites with IDs            |
-| `tesla powerwall status [--watch]`           | Battery %, reserve, grid status                    |
-| `tesla powerwall notify [--level N]`         | Notify once per cycle when the battery reaches N%  |
+| Command                                      | Purpose                                                              |
+|----------------------------------------------|----------------------------------------------------------------------|
+| `tesla auth login [--listen]`                | Headless OAuth; saves the refresh token                              |
+| `tesla auth status`                          | Token validity; refreshes and persists rotation                      |
+| `tesla auth logout`                          | Delete the local token (does not revoke it)                          |
+| `tesla products`                             | List vehicles and energy sites with IDs                              |
+| `tesla powerwall status [--watch]`           | Battery %, reserve, grid status                                      |
+| `tesla powerwall notify [--level N]`         | Notify once per cycle when the battery reaches N%                    |
 | `tesla car status`                           | Battery, range, charging state, plug, charge limit (wakes if asleep) |
-| `tesla car charge start` / `stop`            | Start/stop charging (wakes the car)                |
-| `tesla car charge limit <pct>`               | Set the charge limit (0–100)                       |
-| `tesla auto-charge [flags]`                  | Watch the Powerwall and trigger once               |
-| `tesla key generate` / `register` / `status` | EC key and registration                            |
-| `tesla config show` / `set`                  | View/update configuration                          |
-| `tesla notify test` / `reset` | Send a test notification / clear cooldowns |
-| `tesla doctor`                               | Check config, credentials, auth, IDs, connectivity |
-| `tesla --version`                            | Print the version                                  |
+| `tesla car charge start` / `stop`            | Start/stop charging (wakes the car)                                  |
+| `tesla car charge limit <pct>`               | Set the charge limit (0–100)                                         |
+| `tesla auto-charge [flags]`                  | Watch the Powerwall and trigger once                                 |
+| `tesla key generate` / `register` / `status` | EC key and registration                                              |
+| `tesla config show` / `set`                  | View/update configuration                                            |
+| `tesla notify test` / `reset`                | Send a test notification / clear cooldowns                           |
+| `tesla doctor`                               | Check config, credentials, auth, IDs, connectivity                   |
+| `tesla --version`                            | Print the version                                                    |
 
 Global flags: `-v`/`-vv` for INFO/DEBUG logging, `--log-file FILE` to log
 to a file instead of stderr.
@@ -427,7 +454,7 @@ threshold it only reads the Powerwall. At the threshold it reads the car
 and acts on this table:
 
 | Powerwall    | Vehicle             | `require_plugged` | Action                          |
-| ------------ | ------------------- | ----------------- | ------------------------------- |
+|--------------|---------------------|-------------------|---------------------------------|
 | >= threshold | Charging / Complete | any               | done, exit 0                    |
 | >= threshold | Disconnected        | true              | wait for plug                   |
 | >= threshold | Stopped / NoPower   | any               | wake, set limit, `charge_start` |
@@ -489,14 +516,17 @@ auto-charge stage and after manual charging commands.
 
 ### Get started
 
-1. Install the ntfy app ([Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy), [iOS](https://apps.apple.com/us/app/ntfy/id1625396347)) or open the web app at <https://ntfy.sh/app>, and subscribe to a topic.
+1. Install the ntfy app
+   ([Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy),
+   [iOS](https://apps.apple.com/us/app/ntfy/id1625396347)) or open the web app
+   at <https://ntfy.sh/app>, and subscribe to a topic.
 
 2. Pick a hard-to-guess topic. On public ntfy.sh the topic name is
    effectively a **password** — anyone who knows it can read your
    notifications. The web app includes a topic generator.
 
 3. Put the credentials in `.env` next to the Tesla ones (or export them):
-   
+
    ```shell
    TESLA_NTFY_TOPIC=tesla-<unguessable>
    # optional, for a protected topic or self-hosted server:
@@ -505,7 +535,7 @@ auto-charge stage and after manual charging commands.
    ```
 
 4. Enable it and send a test:
-   
+
    ```shell
    uv run tesla config set notify.enabled true
    uv run tesla notify test
@@ -536,24 +566,24 @@ uv run tesla powerwall notify --level 90
 
 ### What gets sent
 
-| Stage | When | Priority |
-|---|---|---|
-| on_start | watcher starts/restarts: snapshot of the current Powerwall/situation | 2 |
-| wait_plug | entered "at threshold, waiting": asleep, unplugged with `require_plugged`, or unknown state | 3 |
-| charging | `charge_start` verified `Charging` | 4 |
-| already_charging | entered "at threshold, already charging/complete" | 2 |
-| charging_paused | CoS-gate only: paused for insufficient solar, will resume | 3 |
-| charging_stopped | CoS-gate only: latched off below `threshold - stop_margin` | 3 |
-| waiting_powerwall | CoS-gate only: waiting for the Powerwall to reach `threshold` | 3 |
-| cos_disabled | CoS-gate only: Charge on Solar not enabled, not starting | 5 |
-| cos_lower_limit | CoS-gate only: car below the CoS lower limit, not starting | 3 |
-| charging_on_grid | CoS-gate only: grid/Powerwall charging detected, stopped | 4 |
-| trigger_failed / poll_failed | wake, command, verification, or poll error | 4 / 3 |
-| gave_up | 5 consecutive failures | 5 |
-| auth_failed | token problem; re-run `tesla auth login` | 5 |
-| max_runtime | `max_runtime_hours` reached before a trigger | 4 |
-| stopped | SIGINT/SIGTERM in resident mode | 3 |
-| manual | after `car charge start` / `stop` / `limit` | 3 |
+| Stage                        | When                                                                                        | Priority |
+|------------------------------|---------------------------------------------------------------------------------------------|----------|
+| on_start                     | watcher starts/restarts: snapshot of the current Powerwall/situation                        | 2        |
+| wait_plug                    | entered "at threshold, waiting": asleep, unplugged with `require_plugged`, or unknown state | 3        |
+| charging                     | `charge_start` verified `Charging`                                                          | 4        |
+| already_charging             | entered "at threshold, already charging/complete"                                           | 2        |
+| charging_paused              | CoS-gate only: paused for insufficient solar, will resume                                   | 3        |
+| charging_stopped             | CoS-gate only: latched off below `threshold - stop_margin`                                  | 3        |
+| waiting_powerwall            | CoS-gate only: waiting for the Powerwall to reach `threshold`                               | 3        |
+| cos_disabled                 | CoS-gate only: Charge on Solar not enabled, not starting                                    | 5        |
+| cos_lower_limit              | CoS-gate only: car below the CoS lower limit, not starting                                  | 3        |
+| charging_on_grid             | CoS-gate only: grid/Powerwall charging detected, stopped                                    | 4        |
+| trigger_failed / poll_failed | wake, command, verification, or poll error                                                  | 4 / 3    |
+| gave_up                      | 5 consecutive failures                                                                      | 5        |
+| auth_failed                  | token problem; re-run `tesla auth login`                                                    | 5        |
+| max_runtime                  | `max_runtime_hours` reached before a trigger                                                | 4        |
+| stopped                      | SIGINT/SIGTERM in resident mode                                                             | 3        |
+| manual                       | after `car charge start` / `stop` / `limit`                                                 | 3        |
 
 `on_start` sends one snapshot when the watcher starts, so you always know
 the current state: on every process start for the resident loop, and for
