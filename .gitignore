@@ -45,3 +45,4 @@ config.toml
 Thumbs.db
 
 # Note: uv.lock and .python-version are committed on purpose.
+app-base.org
