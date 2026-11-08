@@ -5,11 +5,11 @@
 # copies config/tokens/key and a minimal app .env, then calls deploy.sh.
 #
 # Usage:
-#   TESLA_SERVER=sm@beelink.local scripts/deploy-initial.sh
+#   TESLA_SERVER="<DEPLOY-SERVER>" scripts/deploy-initial.sh
 #   scripts/deploy-initial.sh [user@host]
 #
 # Env:
-#   TESLA_SERVER       destination ssh host (default: sm@beelink.local)
+#   TESLA_SERVER       destination ssh host (default: <DEPLOY-SERVER>)
 #   TESLA_DIR          deployment directory under the server home (default: tesla)
 #   XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
 #
@@ -25,7 +25,7 @@
 set -euo pipefail
 umask 077
 
-DEFAULT_SERVER="sm@beelink.local"
+DEFAULT_SERVER="<DEPLOY-SERVER>"
 SERVER="${TESLA_SERVER:-$DEFAULT_SERVER}"
 TESLA_DIR="${TESLA_DIR:-tesla}"
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -49,11 +49,11 @@ usage() {
 One-time bootstrap for a fresh home-server deployment.
 
 Usage:
-  TESLA_SERVER=sm@beelink.local scripts/deploy-initial.sh
+  TESLA_SERVER="<DEPLOY-SERVER>" scripts/deploy-initial.sh
   scripts/deploy-initial.sh [user@host]
 
 Env:
-  TESLA_SERVER       destination ssh host (default: sm@beelink.local)
+  TESLA_SERVER       destination ssh host (default: <DEPLOY-SERVER>)
   TESLA_DIR          deployment directory under the server home (default: tesla)
   XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
 

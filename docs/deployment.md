@@ -40,7 +40,7 @@ private key, and a minimal app `.env`, fixes ownership and modes, then
 calls `scripts/deploy.sh`.
 
 ```bash
-TESLA_SERVER=sm@beelink.local scripts/deploy-initial.sh
+TESLA_SERVER="<DEPLOY-SERVER>" scripts/deploy-initial.sh
 ```
 
 It refuses to overwrite existing server state unless `--force` is given,

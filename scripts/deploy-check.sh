@@ -12,7 +12,7 @@
 #   scripts/deploy-check.sh --remote-only
 #
 # Env:
-#   TESLA_SERVER       destination ssh host (default: sm@beelink.local)
+#   TESLA_SERVER       destination ssh host (default: <DEPLOY-SERVER>)
 #   XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
 #   TESLA_NTFY_URL     override ntfy URL for the reachability check
 #   TESLA_FLEET_URL    override Fleet API URL for the reachability check
@@ -25,7 +25,7 @@ set -uo pipefail
 export GIT_OPTIONAL_LOCKS=0
 export UV_NO_CACHE=1
 
-DEFAULT_SERVER="sm@beelink.local"
+DEFAULT_SERVER="<DEPLOY-SERVER>"
 SERVER="${TESLA_SERVER:-$DEFAULT_SERVER}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -51,7 +51,7 @@ Usage:
   scripts/deploy-check.sh --remote-only
 
 Env:
-  TESLA_SERVER       destination ssh host (default: sm@beelink.local)
+  TESLA_SERVER       destination ssh host (default: <DEPLOY-SERVER>)
   XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
   TESLA_NTFY_URL     override ntfy URL for the reachability check
   TESLA_FLEET_URL    override Fleet API URL for the reachability check
