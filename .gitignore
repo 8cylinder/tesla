@@ -49,4 +49,7 @@ docs/_build/
 Thumbs.db
 
 # Note: uv.lock and .python-version are committed on purpose.
+
+# Local planning notes (never commit)
 app-base.org
+TESLA.plan.org
