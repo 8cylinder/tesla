@@ -60,13 +60,16 @@ def _dotenv_candidates() -> list[Path]:
 
 def _dotenv_values() -> dict[str, str]:
     values: dict[str, str] = {}
-    for path in _dotenv_candidates():
-        if not path.is_file():
-            continue
+    for path in dotenv_paths():
         for key, value in dotenv_values(path).items():
             if value is not None and key not in values:
                 values[key] = value
     return values
+
+
+def dotenv_paths() -> list[Path]:
+    """Return the existing .env files, in precedence order."""
+    return [path for path in _dotenv_candidates() if path.is_file()]
 
 
 def _first(*values: str | None) -> str | None:

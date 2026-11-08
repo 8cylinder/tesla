@@ -47,6 +47,13 @@ def test_config_show_defaults(config_dir):
     assert "threshold = 100.0" in result.output
 
 
+def test_config_show_prints_path(config_dir):
+    result = invoke(config_dir, "config", "show")
+    assert result.exit_code == 0
+    assert result.output.startswith("# config: ")
+    assert str(config_dir / "config.toml") in result.output
+
+
 def test_config_set_then_show(config_dir):
     result = invoke(config_dir, "config", "set", "auto_charge.threshold", "90")
     assert result.exit_code == 0
@@ -630,6 +637,37 @@ def test_doctor_missing_credentials_exits_2(config_dir, tmp_path, monkeypatch):
     output = combined(result)
     assert "credentials" in output
     assert "tokens" in output
+
+
+def test_doctor_shows_config_and_env_paths(config_dir, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "TESLA_CLIENT_ID=id\nTESLA_CLIENT_SECRET=secret\n"
+    )
+    (config_dir / ".env").write_text("TESLA_NTFY_TOPIC=topic\n")
+    (config_dir / "config.toml").write_text('region = "na"\n')
+
+    result = invoke(config_dir, "doctor")
+
+    output = combined(result)
+    assert str(config_dir / "config.toml") in output
+    assert str(tmp_path / ".env") in output
+    assert str(config_dir / ".env") in output
+    assert str(config_dir / "tokens.json") in output
+
+
+def test_doctor_reports_no_env_file(config_dir, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "TESLA_CLIENT_ID",
+        "TESLA_CLIENT_SECRET",
+        "TESLA_REDIRECT_URI",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    result = invoke(config_dir, "doctor")
+
+    assert "none found; using process environment" in combined(result)
 
 
 def test_notify_test_disabled_exits_2(config_dir):

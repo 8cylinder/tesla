@@ -141,9 +141,10 @@ url = "beelink.local"          # ssh destination for `tesla server`
 ```
 
 Write values with `tesla config set <dotted.key> <value>` and inspect the
-effective result with `tesla config show`. Precedence is command-line
-option > config value > code default. Unknown keys produce a warning and
-are ignored; wrong types are rejected with an error naming the file.
+effective result and its path with `tesla config show`. Precedence is
+command-line option > config value > code default. Unknown keys produce a
+warning and are ignored; wrong types are rejected with an error naming the
+file.
 Relative filesystem paths such as `vehicle.key_path` resolve against the
 config file's directory, not the current working directory. Secrets stay
 in the environment or `.env`; see the setup guide.

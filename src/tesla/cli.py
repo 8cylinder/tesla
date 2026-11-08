@@ -51,6 +51,7 @@ from .client import (
     AuthError,
     Credentials,
     build_vehicle,
+    dotenv_paths,
     ensure_fresh_token,
     env_value,
     exchange_code,
@@ -1133,18 +1134,32 @@ def car_charge_limit(percent: int) -> None:
 def doctor() -> None:
     """Check config, credentials, auth, connectivity, IDs, and keys."""
     rows: list[tuple[str, bool, str]] = []
+    sources: list[tuple[str, Path, str]] = []
     config: Config | None = None
     credentials: Credentials | None = None
     stored: Tokens | None = None
 
     state = _state()
+    config_file = config_path()
     if state.config is not None:
         config = state.config
+        config_file = config.source_path or config_file
         rows.append(("config", True, f"region={config.region}"))
     else:
         rows.append(
             ("config", False, state.config_error or "invalid configuration")
         )
+    config_note = "" if config_file.exists() else "not found; using defaults"
+    rows.append(("config file", True, config_note or "found"))
+    sources.append(("config.toml", config_file, config_note))
+
+    env_files = dotenv_paths()
+    if env_files:
+        rows.append(("env file", True, f"{len(env_files)} found"))
+        for path in env_files:
+            sources.append((".env", path, ""))
+    else:
+        rows.append(("env file", True, "none found; using process environment"))
 
     try:
         credentials = load_credentials()
@@ -1152,6 +1167,7 @@ def doctor() -> None:
     except AuthError as exc:
         rows.append(("credentials", False, str(exc)))
 
+    sources.append(("tokens.json", tokens_path(), ""))
     try:
         stored = load_tokens()
         if stored is None:
@@ -1176,7 +1192,14 @@ def doctor() -> None:
         )
         if config.vehicle.command_mode == "signed":
             path = key_path(config)
-            rows.append(("private key", path.exists(), str(path)))
+            rows.append(
+                (
+                    "private key",
+                    path.exists(),
+                    "present" if path.exists() else "missing",
+                )
+            )
+            sources.append(("private_key.pem", path, ""))
         if config.notify.enabled:
             topic = env_value("TESLA_NTFY_TOPIC")
             rows.append(
@@ -1248,6 +1271,14 @@ def doctor() -> None:
             escape(detail),
         )
     console.print(table)
+    console.print()
+    console.print("Config sources")
+    for label, path, note in sources:
+        suffix = f" ({note})" if note else ""
+        console.print(
+            f"  {label:<16} {escape(str(path))}{escape(suffix)}",
+            soft_wrap=True,
+        )
     if failed:
         raise SystemExit(3 if api_failed else 2)
 
@@ -1457,8 +1488,12 @@ def config() -> None:
 
 @config.command("show")
 def config_show() -> None:
-    """Print the effective configuration."""
-    click.echo(dump_toml(_config()), nl=False)
+    """Print the effective configuration and its path."""
+    config = _config()
+    path = config.source_path or config_path()
+    suffix = "" if path.exists() else " (not found; using defaults)"
+    click.echo(f"# config: {path}{suffix}")
+    click.echo(dump_toml(config), nl=False)
 
 
 @config.command("set")

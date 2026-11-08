@@ -161,7 +161,7 @@ Docker deployment with `tesla server info` and `tesla server logs`.
 
 `tesla products` lists the VIN and energy site ID to use here. Unknown
 keys produce a warning and are ignored; wrong types are rejected.
-`tesla config show` prints the effective configuration and
+`tesla config show` prints the effective configuration and its path, and
 `tesla --config` prints the file path.
 
 ## 6. Authorize (headless)

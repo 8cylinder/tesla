@@ -8,6 +8,7 @@ from tesla.client import (
     AuthError,
     Credentials,
     build_oauth,
+    dotenv_paths,
     ensure_fresh_token,
     extract_public_key,
     generate_key,
@@ -72,6 +73,15 @@ def test_credentials_missing_raises(monkeypatch, tmp_path, config_dir):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(AuthError, match="TESLA_CLIENT_ID"):
         load_credentials()
+
+
+def test_dotenv_paths_lists_existing_files(monkeypatch, tmp_path, config_dir):
+    monkeypatch.chdir(tmp_path)
+    cwd_env = tmp_path / ".env"
+    cwd_env.write_text("TESLA_CLIENT_ID=cwd\n")
+    config_env = config_dir / ".env"
+    config_env.write_text("TESLA_CLIENT_ID=config\n")
+    assert dotenv_paths() == [cwd_env, config_env]
 
 
 def test_explicit_credentials_win(monkeypatch, tmp_path, config_dir):

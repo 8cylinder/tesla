@@ -6,6 +6,8 @@ All notable changes to this project are documented here.
 
 - Add `tesla server` to inspect the remote Docker deployment over SSH:
   container state, image and tag, command, mounts, uptime, and logs.
+- Show the config file, `.env`, token, and key paths in `tesla doctor`,
+  and include the config path in `tesla config show`.
 
 ## [0.1.0] - 2026-11-07
 
