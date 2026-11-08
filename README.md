@@ -83,6 +83,7 @@ options are in the
 | `tesla key generate` / `register` / `status` | EC key and registration                                              |
 | `tesla config show` / `set`                  | View/update configuration                                            |
 | `tesla notify test` / `reset`                | Send a test notification / clear cooldowns                           |
+| `tesla server info` / `logs`                 | Inspect the home-server Docker deployment over SSH                    |
 | `tesla doctor`                               | Check config, credentials, auth, IDs, connectivity                   |
 
 Global options: `-h`/`--help`, `--version`, `--config`, `--completions`,
@@ -134,6 +135,9 @@ tags = "tesla"
 min_priority = 1
 verbose = false
 on_start = true
+
+[server]
+url = "beelink.local"          # ssh destination for `tesla server`
 ```
 
 Write values with `tesla config set <dotted.key> <value>` and inspect the

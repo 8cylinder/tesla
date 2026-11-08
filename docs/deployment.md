@@ -147,6 +147,37 @@ history, raise `max-size`/`max-file` in `deploy/compose.yaml`, or use
 `--log-file /config/tesla/tesla.log` in the Compose command plus host
 `logrotate`.
 
+### Remote inspection
+
+From a machine with SSH access to the server, point the CLI at the
+deployment once:
+
+```bash
+tesla config set server.url beelink.local
+```
+
+Then inspect the container or read its logs without logging in to the
+server:
+
+```bash
+tesla server info
+tesla server logs --tail 100
+tesla server logs -f
+```
+
+`info` reports the container state, image and tag, configured command
+and arguments, mounts, and uptime by running `docker inspect tesla-app`
+over SSH. It deliberately does not print the container environment.
+`logs` wraps `docker logs`; `--follow` streams until interrupted and
+`--tail` defaults to 200 lines. Pass `--url` to override the configured
+host:
+
+```bash
+tesla server --url=other-host info
+```
+
+SSH host aliases from `~/.ssh/config` work as usual.
+
 ### Backups
 
 `deploy/backup.sh` archives `config/` into `backups/` and keeps the

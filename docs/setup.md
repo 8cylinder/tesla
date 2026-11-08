@@ -151,7 +151,13 @@ verbose = false                # true = ignore cooldowns (observation mode)
 on_start = true                # report the current state on start/restart
 # The topic and token are credentials and live in the environment:
 #   TESLA_NTFY_TOPIC, TESLA_NTFY_TOKEN (optional), TESLA_NTFY_URL (optional)
+
+[server]
+url = "beelink.local"          # ssh destination for `tesla server`
 ```
+
+Set `server.url` to the home server's SSH destination to inspect the
+Docker deployment with `tesla server info` and `tesla server logs`.
 
 `tesla products` lists the VIN and energy site ID to use here. Unknown
 keys produce a warning and are ignored; wrong types are rejected.

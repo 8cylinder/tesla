@@ -82,6 +82,14 @@ from .config import (
 from .logging import setup_logging
 from .notify import NotifyError, NtfyNotifier, build_notifier
 from .powerwall import backup_reserve, grid_status, percentage_charged
+from .server import (
+    ContainerInfo,
+    ServerError,
+    fetch_info,
+    format_uptime,
+    stream_logs,
+    validate_url,
+)
 from .tokens import TokenError, Tokens, load_tokens
 
 LOGGER = logging.getLogger(__name__)
@@ -97,6 +105,7 @@ class AppState:
     config_error: str | None
     console: Console
     err_console: Console
+    server_url: str | None = None
 
 
 class _HelpOptions:
@@ -439,7 +448,7 @@ def cli(
         )
     except ConfigError as exc:
         state.config_error = str(exc)
-        if ctx.invoked_subcommand != "doctor":
+        if ctx.invoked_subcommand not in ("doctor", "server"):
             _fail(state.config_error)
 
 
@@ -544,6 +553,105 @@ def notify_reset() -> None:
         console.print(f"[green]Cleared[/green] {escape(str(path))}")
     else:
         console.print("No notification state to clear.")
+
+
+@cli.group()
+@click.option(
+    "--url",
+    default=None,
+    metavar="SSH_DEST",
+    help="SSH destination of the server; defaults to server.url.",
+)
+def server(url: str | None) -> None:
+    """Inspect the Docker deployment on the home server."""
+    _state().server_url = url
+
+
+def _server_url() -> str:
+    state = _state()
+    target = state.server_url
+    if target is None:
+        target = _config().server.url
+    if not target:
+        _fail(
+            "no server URL configured; pass --url or run "
+            "'tesla config set server.url <host>'"
+        )
+    try:
+        target = validate_url(target)
+    except ServerError as exc:
+        _fail(str(exc))
+    state.server_url = target
+    return target
+
+
+def _render_server_info(url: str, info: ContainerInfo) -> None:
+    state = info.status
+    if state != "running" and info.exit_code:
+        state = f"{state} (exit {info.exit_code})"
+    table = Table(title=f"Server {escape(url)}")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("Container", escape(info.name))
+    table.add_row("State", escape(state))
+    table.add_row("Image", escape(info.image or "-"))
+    table.add_row("Tag", escape(info.tag or "-"))
+    table.add_row("Command", escape(info.command))
+    uptime = (
+        format_uptime(info.started_at)
+        if info.status == "running"
+        else "not running"
+    )
+    table.add_row("Uptime", escape(uptime))
+    console.print(table)
+    if not info.mounts:
+        console.print("Mounts: none")
+        return
+    mounts = Table(title="Mounts")
+    mounts.add_column("Source")
+    mounts.add_column("Destination")
+    mounts.add_column("Mode")
+    for mount in info.mounts:
+        mode = mount.mode or ("rw" if mount.read_write else "ro")
+        mounts.add_row(
+            escape(mount.source or "-"),
+            escape(mount.destination or "-"),
+            escape(mode),
+        )
+    console.print(mounts)
+
+
+@server.command("info")
+def server_info() -> None:
+    """Show container state, image, command, mounts, and uptime."""
+    url = _server_url()
+    try:
+        info = fetch_info(url)
+    except ServerError as exc:
+        _fail(str(exc), 3)
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+    _render_server_info(url, info)
+
+
+@server.command("logs")
+@click.option("-f", "--follow", is_flag=True, help="Follow log output.")
+@click.option(
+    "-t",
+    "--tail",
+    type=click.IntRange(min=0),
+    default=200,
+    show_default=True,
+    help="Lines to show from the end of the logs.",
+)
+def server_logs(follow: bool, tail: int) -> None:
+    """Show or follow logs from the server container."""
+    try:
+        code = stream_logs(_server_url(), follow=follow, tail=tail)
+    except ServerError as exc:
+        _fail(str(exc), 3)
+    if code:
+        raise SystemExit(code)
 
 
 @cli.command()

@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+- Add `tesla server` to inspect the remote Docker deployment over SSH:
+  container state, image and tag, command, mounts, uptime, and logs.
+
 ## [0.1.0] - 2026-11-07
 
 - Tesla Fleet API CLI for Powerwall-aware vehicle charging.

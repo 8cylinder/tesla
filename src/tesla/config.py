@@ -85,6 +85,11 @@ class NotifyConfig:
 
 
 @dataclass
+class ServerConfig:
+    url: str | None = None
+
+
+@dataclass
 class Config:
     region: str = "na"
     domain: str | None = None
@@ -92,6 +97,7 @@ class Config:
     powerwall: PowerwallConfig = field(default_factory=PowerwallConfig)
     auto_charge: AutoChargeConfig = field(default_factory=AutoChargeConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    server: ServerConfig = field(default_factory=ServerConfig)
     source_path: Path | None = field(default=None, repr=False, compare=False)
 
 
@@ -140,6 +146,9 @@ _SCHEMA: dict[str, Any] = {
         "min_priority": int,
         "verbose": bool,
         "on_start": bool,
+    },
+    "server": {
+        "url": str,
     },
 }
 
@@ -218,6 +227,8 @@ def _check_values(config: Config) -> None:
         raise ConfigError("notify.min_priority must be in [1, 5]")
     if not config.notify.url:
         raise ConfigError("notify.url must not be empty")
+    if config.server.url is not None and not config.server.url.strip():
+        raise ConfigError("server.url must not be empty")
 
 
 def _build(
@@ -239,6 +250,8 @@ def _build(
         setattr(config.auto_charge, key, value)
     for key, value in (cleaned.get("notify") or {}).items():
         setattr(config.notify, key, value)
+    for key, value in (cleaned.get("server") or {}).items():
+        setattr(config.server, key, value)
     _check_values(config)
     return config
 
@@ -370,7 +383,11 @@ def dump_toml(config: Config) -> str:
         f"min_priority = {_toml(config.notify.min_priority)}",
         f"verbose = {_toml(config.notify.verbose)}",
         f"on_start = {_toml(config.notify.on_start)}",
+        "",
+        "[server]",
     ]
+    if config.server.url is not None:
+        lines.append(f"url = {_toml(config.server.url)}")
     return "\n".join(lines) + "\n"
 
 
