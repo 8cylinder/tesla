@@ -175,14 +175,18 @@ async def test_watch_backoff_gives_up(config_dir):
         delays.append(delay)
 
     assert (
-        await watch(client, load_config(), sleep=fake_sleep, jitter=lambda a, b: 1.0)
+        await watch(
+            client, load_config(), sleep=fake_sleep, jitter=lambda a, b: 1.0
+        )
         == 3
     )
     assert delays == [5.0, 10.0, 20.0, 40.0]
 
 
 async def test_watch_wake_timeout_once(config_dir):
-    client = FakeClient(pcts=[100.0], states=["Stopped"], wake_error=VehicleOffline())
+    client = FakeClient(
+        pcts=[100.0], states=["Stopped"], wake_error=VehicleOffline()
+    )
     assert await watch(client, load_config(), once=True) == 3
 
 
@@ -332,7 +336,9 @@ async def test_watch_below_threshold_notes_situation(config_dir):
 async def test_watch_dry_run_sends_no_notifications(config_dir):
     notifier = FakeNotifier()
     client = FakeClient(pcts=[100.0], states=["Stopped"])
-    assert await watch(client, load_config(), dry_run=True, notifier=notifier) == 0
+    assert (
+        await watch(client, load_config(), dry_run=True, notifier=notifier) == 0
+    )
     assert notifier.calls == []
     assert notifier.situations == []
     assert notifier.touch_calls == 0
@@ -391,14 +397,41 @@ COS = ChargeOnSolarSettings(enabled=True, lower_limit=20.0, upper_limit=80.0)
 
 
 @pytest.mark.parametrize(
-    ("pct", "state", "battery", "cos_state", "cos_reason", "cos", "action", "reason"),
+    (
+        "pct",
+        "state",
+        "battery",
+        "cos_state",
+        "cos_reason",
+        "cos",
+        "action",
+        "reason",
+    ),
     [
         (95.0, "Stopped", 60, None, None, COS, Action.START, None),
-        (94.9, "Stopped", 60, None, None, COS, Action.SLEEP, "waiting_powerwall"),
+        (
+            94.9,
+            "Stopped",
+            60,
+            None,
+            None,
+            COS,
+            Action.SLEEP,
+            "waiting_powerwall",
+        ),
         (95.0, "Stopped", 10, None, None, COS, Action.WAIT, "cos_lower_limit"),
         (None, "Stopped", 60, None, None, COS, Action.WAIT, None),
         (92.0, "Charging", 60, None, None, COS, Action.SLEEP, None),
-        (89.9, "Charging", 60, None, None, COS, Action.STOP, "charging_stopped"),
+        (
+            89.9,
+            "Charging",
+            60,
+            None,
+            None,
+            COS,
+            Action.STOP,
+            "charging_stopped",
+        ),
         (
             96.0,
             "Charging",
@@ -493,7 +526,16 @@ COS = ChargeOnSolarSettings(enabled=True, lower_limit=20.0, upper_limit=80.0)
             Action.WAIT,
             "cos_disabled",
         ),
-        (95.0, "Stopped", 60, "user_disabled", None, COS, Action.WAIT, "cos_disabled"),
+        (
+            95.0,
+            "Stopped",
+            60,
+            "user_disabled",
+            None,
+            COS,
+            Action.WAIT,
+            "cos_disabled",
+        ),
         (95.0, None, None, None, None, COS, Action.WAIT, None),
     ],
 )
@@ -517,7 +559,9 @@ class FakeGateClient:
         self.cos = (
             cos
             if cos is not None
-            else ChargeOnSolarSettings(enabled=True, lower_limit=20.0, upper_limit=80.0)
+            else ChargeOnSolarSettings(
+                enabled=True, lower_limit=20.0, upper_limit=80.0
+            )
         )
         self.current_pct = 0.0
         self.current_status = VehicleStatus()

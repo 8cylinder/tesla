@@ -51,7 +51,9 @@ def save_tokens(tokens: Tokens, path: Path | None = None) -> None:
     payload = json.dumps(
         {"refresh_token": tokens.refresh_token, "expires": tokens.expires}
     )
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".tokens-", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=".tokens-", suffix=".tmp"
+    )
     tmp_path = Path(tmp_name)
     try:
         os.fchmod(fd, 0o600)

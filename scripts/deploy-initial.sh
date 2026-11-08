@@ -11,7 +11,7 @@
 # Env:
 #   TESLA_SERVER       destination ssh host (default: sm@beelink.local)
 #   TESLA_DIR          deployment directory under the server home (default: tesla)
-#   TESLA_CONFIG_DIR   local state directory (default: ~/.config/tesla)
+#   XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
 #
 # Flags:
 #   --force            replace existing server config/tokens
@@ -28,7 +28,11 @@ umask 077
 DEFAULT_SERVER="sm@beelink.local"
 SERVER="${TESLA_SERVER:-$DEFAULT_SERVER}"
 TESLA_DIR="${TESLA_DIR:-tesla}"
-CONFIG_DIR="${TESLA_CONFIG_DIR:-$HOME/.config/tesla}"
+if [ "$(uname -s)" = "Darwin" ]; then
+  CONFIG_DIR="$HOME/Library/Application Support/tesla"
+else
+  CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tesla"
+fi
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 TOKENS_FILE="$CONFIG_DIR/tokens.json"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,7 +55,7 @@ Usage:
 Env:
   TESLA_SERVER       destination ssh host (default: sm@beelink.local)
   TESLA_DIR          deployment directory under the server home (default: tesla)
-  TESLA_CONFIG_DIR   local state directory (default: ~/.config/tesla)
+  XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
 
 Flags:
   --force            replace existing server config/tokens
@@ -135,8 +139,6 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
-
-export TESLA_CONFIG_DIR="$CONFIG_DIR"
 
 SSH_OPTS=(
   -o BatchMode=yes
@@ -300,6 +302,10 @@ NOTIFY_URL="$(cfg_get notify_url)"
 KEY_PATH="$(cfg_get key_path)"
 if [ -n "$KEY_PATH" ]; then
   KEY_PATH="${KEY_PATH/#\~/$HOME}"
+  case "$KEY_PATH" in
+    /*) ;;
+    *) KEY_PATH="$CONFIG_DIR/$KEY_PATH" ;;
+  esac
 else
   KEY_PATH="$CONFIG_DIR/private_key.pem"
 fi
@@ -393,7 +399,7 @@ fi
 
 REMOTE_DIR="\$HOME/$TESLA_DIR"
 existing="$(ssh "${SSH_OPTS[@]}" "$SERVER" \
-  "for f in config.toml tokens.json .env; do [ -e \"$REMOTE_DIR/config/\$f\" ] && echo \"\$f\"; done" \
+  "for f in config.toml tokens.json .env; do [ -e \"$REMOTE_DIR/config/tesla/\$f\" ] && echo \"\$f\"; done" \
   2>/dev/null || true)"
 
 if [ -n "$existing" ]; then
@@ -434,13 +440,13 @@ fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
   info "dry-run: would run 'uv run tesla powerwall status' locally (refreshes tokens first)"
-  info "dry-run: would create ~/$TESLA_DIR/config and copy:"
-  info "  $CONFIG_FILE -> $SERVER:~/$TESLA_DIR/config/config.toml"
-  info "  $TOKENS_FILE -> $SERVER:~/$TESLA_DIR/config/tokens.json"
+  info "dry-run: would create ~/$TESLA_DIR/config/tesla and copy:"
+  info "  $CONFIG_FILE -> $SERVER:~/$TESLA_DIR/config/tesla/config.toml"
+  info "  $TOKENS_FILE -> $SERVER:~/$TESLA_DIR/config/tesla/tokens.json"
   if [ "$HAVE_KEY" -eq 1 ]; then
-    info "  $KEY_PATH -> $SERVER:~/$TESLA_DIR/config/private_key.pem"
+    info "  $KEY_PATH -> $SERVER:~/$TESLA_DIR/config/tesla/private_key.pem"
   fi
-  info "  minimal app .env -> $SERVER:~/$TESLA_DIR/config/.env"
+  info "  minimal app .env -> $SERVER:~/$TESLA_DIR/config/tesla/.env"
   info "dry-run: would run: TESLA_SERVER=$SERVER TESLA_DIR=$TESLA_DIR scripts/deploy.sh"
   say "Dry run complete; nothing changed"
   exit 0
@@ -453,31 +459,31 @@ fi
 
 say "Copying state to $SERVER"
 if ! ssh "${SSH_OPTS[@]}" "$SERVER" \
-  "mkdir -p ~/$TESLA_DIR/config ~/$TESLA_DIR/images ~/$TESLA_DIR/backups && chmod 700 ~/$TESLA_DIR/config"; then
-  die "could not create ~/$TESLA_DIR/config on $SERVER"
+  "mkdir -p ~/$TESLA_DIR/config/tesla ~/$TESLA_DIR/images ~/$TESLA_DIR/backups && chmod 700 ~/$TESLA_DIR/config ~/$TESLA_DIR/config/tesla"; then
+  die "could not create ~/$TESLA_DIR/config/tesla on $SERVER"
 fi
 
-if ! scp "${SCP_OPTS[@]}" "$CONFIG_FILE" "$TOKENS_FILE" "$SERVER:$TESLA_DIR/config/"; then
+if ! scp "${SCP_OPTS[@]}" "$CONFIG_FILE" "$TOKENS_FILE" "$SERVER:$TESLA_DIR/config/tesla/"; then
   die "could not copy config.toml/tokens.json to $SERVER"
 fi
 if [ "$HAVE_KEY" -eq 1 ]; then
   if [ "$KEY_PATH" != "$CONFIG_DIR/private_key.pem" ]; then
     warn "config.toml uses vehicle.key_path=$KEY_PATH; it is copied as private_key.pem on the server"
   fi
-  if ! scp "${SCP_OPTS[@]}" "$KEY_PATH" "$SERVER:$TESLA_DIR/config/private_key.pem"; then
+  if ! scp "${SCP_OPTS[@]}" "$KEY_PATH" "$SERVER:$TESLA_DIR/config/tesla/private_key.pem"; then
     die "could not copy the private key to $SERVER"
   fi
 fi
-if ! scp "${SCP_OPTS[@]}" "$TMP_ENV" "$SERVER:$TESLA_DIR/config/.env"; then
+if ! scp "${SCP_OPTS[@]}" "$TMP_ENV" "$SERVER:$TESLA_DIR/config/tesla/.env"; then
   die "could not copy the app .env to $SERVER"
 fi
 
-remote_files="~/$TESLA_DIR/config/config.toml ~/$TESLA_DIR/config/tokens.json ~/$TESLA_DIR/config/.env"
+remote_files="~/$TESLA_DIR/config/tesla/config.toml ~/$TESLA_DIR/config/tesla/tokens.json ~/$TESLA_DIR/config/tesla/.env"
 if [ "$HAVE_KEY" -eq 1 ]; then
-  remote_files="$remote_files ~/$TESLA_DIR/config/private_key.pem"
+  remote_files="$remote_files ~/$TESLA_DIR/config/tesla/private_key.pem"
 fi
 if ! ssh "${SSH_OPTS[@]}" "$SERVER" \
-  "chown -R \$(id -u):\$(id -g) ~/$TESLA_DIR/config && chmod 700 ~/$TESLA_DIR/config && chmod 600 $remote_files"; then
+  "chown -R \$(id -u):\$(id -g) ~/$TESLA_DIR/config && chmod 700 ~/$TESLA_DIR/config ~/$TESLA_DIR/config/tesla && chmod 600 $remote_files"; then
   die "could not fix ownership/permissions on $SERVER"
 fi
 
@@ -516,14 +522,14 @@ if [ "$TEST_NOTIFY" -eq 1 ]; then
   say "Sending a remote ntfy test"
   if ! ssh "${SSH_OPTS[@]}" "$SERVER" \
     "cd ~/$TESLA_DIR && docker compose exec -T tesla tesla notify test"; then
-    die "remote notify test failed; check TESLA_NTFY_TOPIC/URL in ~/$TESLA_DIR/config/.env"
+    die "remote notify test failed; check TESLA_NTFY_TOPIC/URL in ~/$TESLA_DIR/config/tesla/.env"
   fi
 fi
 
 say "Deployment complete"
 cat <<EOF
 Server:   $SERVER
-State:    ~/$TESLA_DIR/config
+State:    ~/$TESLA_DIR/config/tesla
 Logs:     ssh $SERVER 'docker logs -f tesla-app'
 Update:   TESLA_SERVER=$SERVER TESLA_DIR=$TESLA_DIR scripts/deploy.sh
 Backups:  add '0 4 * * 0 \$HOME/$TESLA_DIR/backup.sh' to the server crontab

@@ -32,7 +32,7 @@ echo "==> saving $TAR"
 docker save "$IMAGE" | gzip > "$TAR"
 
 echo "==> uploading to $TESLA_SERVER:~/$TESLA_DIR"
-ssh "$TESLA_SERVER" "mkdir -p ~/$TESLA_DIR/images ~/$TESLA_DIR/config ~/$TESLA_DIR/backups && chmod 700 ~/$TESLA_DIR/config"
+ssh "$TESLA_SERVER" "mkdir -p ~/$TESLA_DIR/images ~/$TESLA_DIR/config/tesla ~/$TESLA_DIR/backups && chmod 700 ~/$TESLA_DIR/config ~/$TESLA_DIR/config/tesla"
 scp "$REPO/deploy/compose.yaml" "$TESLA_SERVER:$TESLA_DIR/compose.yaml"
 scp "$REPO/deploy/backup.sh" "$TESLA_SERVER:$TESLA_DIR/backup.sh"
 scp "$TAR" "$TESLA_SERVER:$TESLA_DIR/images/"

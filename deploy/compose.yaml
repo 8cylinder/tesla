@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     user: "${TESLA_UID:-1000}:${TESLA_GID:-1000}"
     environment:
-      TESLA_CONFIG_DIR: /config
+      XDG_CONFIG_HOME: /config
       TZ: ${TZ:-UTC}
     volumes:
       - ./config:/config

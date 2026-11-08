@@ -13,7 +13,7 @@
 #
 # Env:
 #   TESLA_SERVER       destination ssh host (default: sm@beelink.local)
-#   TESLA_CONFIG_DIR   app state directory (default: ~/.config/tesla)
+#   XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
 #   TESLA_NTFY_URL     override ntfy URL for the reachability check
 #   TESLA_FLEET_URL    override Fleet API URL for the reachability check
 #
@@ -28,7 +28,11 @@ export UV_NO_CACHE=1
 DEFAULT_SERVER="sm@beelink.local"
 SERVER="${TESLA_SERVER:-$DEFAULT_SERVER}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_DIR="${TESLA_CONFIG_DIR:-$HOME/.config/tesla}"
+if [ "$(uname -s)" = "Darwin" ]; then
+  CONFIG_DIR="$HOME/Library/Application Support/tesla"
+else
+  CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tesla"
+fi
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 
 DO_LOCAL=1
@@ -48,7 +52,7 @@ Usage:
 
 Env:
   TESLA_SERVER       destination ssh host (default: sm@beelink.local)
-  TESLA_CONFIG_DIR   app state directory (default: ~/.config/tesla)
+  XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
   TESLA_NTFY_URL     override ntfy URL for the reachability check
   TESLA_FLEET_URL    override Fleet API URL for the reachability check
 EOF
@@ -452,8 +456,11 @@ if [ "$DO_LOCAL" -eq 1 ]; then
   check_state_file "$CONFIG_DIR/tokens.json" "tokens.json" fail
 
   if [ -n "$CFG_KEY_PATH" ]; then
-    KEY_PATH="$CFG_KEY_PATH"
-    KEY_PATH="${KEY_PATH/#\~/$HOME}"
+    KEY_PATH="${CFG_KEY_PATH/#\~/$HOME}"
+    case "$KEY_PATH" in
+      /*) ;;
+      *) KEY_PATH="$CONFIG_DIR/$KEY_PATH" ;;
+    esac
   else
     KEY_PATH="$CONFIG_DIR/private_key.pem"
   fi
@@ -563,7 +570,7 @@ if [ "$DO_LOCAL" -eq 1 ]; then
 
     if [ -n "$(env_get SSH || true)" ] || [ -n "$(env_get SSH_SUDO || true)" ]; then
       warn "app .env contains SSH/SSH_SUDO; do not copy it verbatim to the server"
-      info "create a minimal ~/tesla/config/.env with only TESLA_* and NTFY_* keys"
+      info "create a minimal ~/tesla/config/tesla/.env with only TESLA_* and NTFY_* keys"
     fi
 
     redirect_uri="$(env_get TESLA_REDIRECT_URI || true)"
@@ -636,7 +643,7 @@ fi
 echo "tar_ok=$(command -v tar >/dev/null 2>&1 && echo yes || echo no)"
 echo "gzip_ok=$(command -v gzip >/dev/null 2>&1 && echo yes || echo no)"
 for f in config.toml tokens.json private_key.pem .env; do
-  p="$HOME/tesla/config/$f"
+  p="$HOME/tesla/config/tesla/$f"
   if [ -e "$p" ]; then
     echo "cfg_${f//./_}_mode=$(stat -c %a "$p" 2>/dev/null || echo unknown)"
   else
@@ -806,9 +813,9 @@ REMOTE
             if [ $((num & 077)) -eq 0 ]; then
               pass "$label mode $mode"
             elif [ "$severity" = fail ]; then
-              fail "$label is group/other-accessible (mode $mode); run: chmod 600 ~/tesla/config/$label"
+              fail "$label is group/other-accessible (mode $mode); run: chmod 600 ~/tesla/config/tesla/$label"
             else
-              warn "$label is group/other-accessible (mode $mode); run: chmod 600 ~/tesla/config/$label"
+              warn "$label is group/other-accessible (mode $mode); run: chmod 600 ~/tesla/config/tesla/$label"
             fi
             ;;
         esac

@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 import aiohttp
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from tesla_fleet_api.exceptions import (
     InvalidScope,
@@ -60,9 +65,11 @@ from .client import (
     register_domain,
     registered_public_key,
 )
+from .completions import install_bash_completion
 from .config import (
     Config,
     ConfigError,
+    config_path,
     dump_toml,
     key_path,
     load_config,
@@ -73,24 +80,155 @@ from .config import (
     tokens_path,
 )
 from .logging import setup_logging
-from .notify import NotifyError, build_notifier
+from .notify import NotifyError, NtfyNotifier, build_notifier
 from .powerwall import backup_reserve, grid_status, percentage_charged
 from .tokens import TokenError, Tokens, load_tokens
 
-console = Console()
-err_console = Console(stderr=True)
 LOGGER = logging.getLogger(__name__)
 
 _AUTH_FAULTS = (OAuthExpired, InvalidToken, LoginRequired)
 
 
-def _fail(message: str, code: int = 2) -> None:
-    err_console.print(f"[red]error:[/red] {message}")
+@dataclass
+class AppState:
+    """Per-invocation runtime state."""
+
+    config: Config | None
+    config_error: str | None
+    console: Console
+    err_console: Console
+
+
+class _HelpOptions:
+    def __init__(  # noqa: ANN401
+        self,
+        *args: Any,  # noqa: ANN401
+        **kwargs: Any,  # noqa: ANN401
+    ) -> None:
+        context_settings = dict(kwargs.pop("context_settings", {}) or {})
+        context_settings.setdefault("help_option_names", ["-h", "--help"])
+        super().__init__(
+            *args,
+            context_settings=context_settings,  # ty: ignore[unknown-argument]
+            **kwargs,
+        )
+
+
+class AppCommand(_HelpOptions, click.Command):
+    pass
+
+
+class AppGroup(_HelpOptions, click.Group):
+    command_class = AppCommand
+    group_class = type
+
+
+def _state() -> AppState:
+    ctx = click.get_current_context()
+    if isinstance(ctx.obj, AppState):
+        return ctx.obj
+    raise RuntimeError("application state is not initialized")
+
+
+def _current_console(stderr: bool = False) -> Console:
+    ctx = click.get_current_context(silent=True)
+    if ctx is not None and isinstance(ctx.obj, AppState):
+        return ctx.obj.err_console if stderr else ctx.obj.console
+    return Console(stderr=stderr)
+
+
+class _ConsoleProxy:
+    def __init__(self, stderr: bool = False) -> None:
+        self._stderr = stderr
+
+    def print(  # noqa: ANN401
+        self,
+        *objects: Any,  # noqa: ANN401
+        **kwargs: Any,  # noqa: ANN401
+    ) -> None:
+        _current_console(self._stderr).print(*objects, **kwargs)
+
+
+console = _ConsoleProxy()
+err_console = _ConsoleProxy(stderr=True)
+
+
+def _color_setting(color: str) -> bool | None:
+    mode = color.lower()
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if os.environ.get("FORCE_COLOR", "") not in ("", "0"):
+        return True
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    return None
+
+
+def _build_consoles(color: str) -> tuple[Console, Console]:
+    setting = _color_setting(color)
+    if setting is True:
+        return (
+            Console(force_terminal=True),
+            Console(stderr=True, force_terminal=True),
+        )
+    if setting is False:
+        return (
+            Console(color_system=None, no_color=True),
+            Console(stderr=True, color_system=None, no_color=True),
+        )
+    return Console(), Console(stderr=True)
+
+
+def _fail(message: str, code: int = 2) -> NoReturn:
+    _current_console(stderr=True).print(f"[red]error:[/red] {escape(message)}")
     raise SystemExit(code)
 
 
+def _warn(message: str) -> None:
+    _current_console(stderr=True).print(
+        f"[yellow]warning:[/yellow] {escape(message)}"
+    )
+
+
+def _config() -> Config:
+    state = _state()
+    if state.config is None:
+        _fail(state.config_error or "configuration is invalid")
+    return state.config
+
+
+def config_callback(
+    ctx: click.Context,
+    _param: click.Parameter,
+    value: bool,
+) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+    click.echo(config_path())
+    ctx.exit()
+
+
+def completions_callback(
+    ctx: click.Context,
+    _param: click.Parameter,
+    value: bool,
+) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+    if not isinstance(ctx.command, click.Group):
+        raise click.ClickException("--completions requires a command group")
+    install_bash_completion(
+        ctx.command,
+        ctx.info_name or "tesla",
+        __version__,
+    )
+    ctx.exit()
+
+
 @contextmanager
-def _api_errors():
+def _api_errors() -> Generator[None]:
     """Translate known failures into exit codes: 2 auth/config, 3 API."""
     try:
         yield
@@ -109,10 +247,18 @@ def _api_errors():
 
 
 def _format_expiry(expires: int) -> str:
-    return datetime.fromtimestamp(expires).astimezone().isoformat(timespec="seconds")
+    return (
+        datetime.fromtimestamp(expires)
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
 
 
-async def _respond(writer, status: str, message: str) -> None:
+async def _respond(
+    writer: asyncio.StreamWriter,
+    status: str,
+    message: str,
+) -> None:
     body = f"<html><body><p>{message}</p></body></html>".encode()
     headers = (
         f"HTTP/1.1 {status}\r\n"
@@ -133,13 +279,18 @@ async def _wait_for_callback(redirect_uri: str, timeout: float = 300.0) -> str:
     loop = asyncio.get_running_loop()
     result: asyncio.Future[str] = loop.create_future()
 
-    async def handle(reader, writer) -> None:
+    async def handle(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
         try:
             request_line = await reader.readline()
             parts = request_line.decode("latin-1").split()
             path = parts[1] if len(parts) >= 2 else "/"
             if path.split("?", 1)[0] != expected_path:
-                await _respond(writer, "404 Not Found", "Not the callback path.")
+                await _respond(
+                    writer, "404 Not Found", "Not the callback path."
+                )
                 return
             try:
                 code = parse_callback(f"http://{host}:{port}{path}")
@@ -150,7 +301,9 @@ async def _wait_for_callback(redirect_uri: str, timeout: float = 300.0) -> str:
                 return
             if not result.done():
                 result.set_result(code)
-            await _respond(writer, "200 OK", "Login captured. You can close this tab.")
+            await _respond(
+                writer, "200 OK", "Login captured. You can close this tab."
+            )
         except (ConnectionError, ValueError):
             pass
         finally:
@@ -168,16 +321,18 @@ async def _wait_for_callback(redirect_uri: str, timeout: float = 300.0) -> str:
 
 
 async def _login(credentials: Credentials, listen: bool) -> Tokens:
-    config = load_config()
+    config = _config()
     async with oauth_client(credentials=credentials, config=config) as oauth:
         url = oauth.get_login_url(SCOPES)
         console.print("Open this URL on any phone or laptop and authorize:")
-        console.print(url, highlight=False, soft_wrap=True)
+        console.print(escape(url), highlight=False, soft_wrap=True)
         if listen:
             parsed = urlparse(credentials.redirect_uri)
             host = parsed.hostname or "localhost"
             port = parsed.port or 8085
-            console.print(f"Waiting for the callback on http://{host}:{port} ...")
+            console.print(
+                f"Waiting for the callback on http://{escape(host)}:{port} ..."
+            )
             code = await _wait_for_callback(credentials.redirect_uri)
         else:
             console.print(
@@ -189,7 +344,7 @@ async def _login(credentials: Credentials, listen: bool) -> Tokens:
         return await exchange_code(oauth, code)
 
 
-def _render_products(data: dict) -> None:
+def _render_products(data: dict[str, Any]) -> None:
     items = data.get("response")
     if not isinstance(items, list):
         _fail("unexpected products response", 3)
@@ -202,9 +357,9 @@ def _render_products(data: dict) -> None:
         table.add_column("ID")
         for item in vehicles:
             table.add_row(
-                str(item.get("vin", "")),
-                str(item.get("state", "")),
-                str(item.get("id", "")),
+                escape(str(item.get("vin", ""))),
+                escape(str(item.get("state", ""))),
+                escape(str(item.get("id", ""))),
             )
         console.print(table)
     if sites:
@@ -214,27 +369,78 @@ def _render_products(data: dict) -> None:
         table.add_column("Name")
         for item in sites:
             table.add_row(
-                str(item["energy_site_id"]),
-                str(item.get("resource_type", "")),
-                str(item.get("site_name", "")),
+                escape(str(item["energy_site_id"])),
+                escape(str(item.get("resource_type", ""))),
+                escape(str(item.get("site_name", ""))),
             )
         console.print(table)
     if not vehicles and not sites:
         console.print("No products found.")
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
-@click.version_option(__version__, prog_name="tesla")
-@click.option("-v", "--verbose", count=True, help="Increase log verbosity (-v, -vv).")
+@click.group(cls=AppGroup, no_args_is_help=True)
+@click.version_option(package_name="tesla", prog_name="tesla")
+@click.option(
+    "--config",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=config_callback,
+    help="Print the config file path and exit.",
+)
+@click.option(
+    "--completions",
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=completions_callback,
+    help="Write bash completions and exit.",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    count=True,
+    help="Increase log verbosity (-v, -vv).",
+)
 @click.option(
     "--log-file",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
     help="Write logs to FILE instead of stderr.",
 )
-def cli(verbose: int, log_file: Path | None) -> None:
+@click.option(
+    "--color",
+    type=click.Choice(["auto", "always", "never"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Control colored output.",
+)
+@click.pass_context
+def cli(
+    ctx: click.Context,
+    verbose: int,
+    log_file: Path | None,
+    color: str,
+) -> None:
     """Tesla Fleet API CLI: Powerwall-aware vehicle charging."""
-    setup_logging(verbose, log_file)
+    out_console, err_console_obj = _build_consoles(color)
+    state = AppState(
+        config=None,
+        config_error=None,
+        console=out_console,
+        err_console=err_console_obj,
+    )
+    ctx.obj = state
+    ctx.color = _color_setting(color)
+    setup_logging(verbose, log_file, console=err_console_obj)
+    try:
+        state.config = load_config(
+            on_unknown=lambda key: _warn(f"ignoring unknown config key {key!r}")
+        )
+    except ConfigError as exc:
+        state.config_error = str(exc)
+        if ctx.invoked_subcommand != "doctor":
+            _fail(state.config_error)
 
 
 @cli.group()
@@ -263,7 +469,7 @@ def auth_login(listen: bool) -> None:
 def auth_status() -> None:
     """Show token validity, refreshing and persisting rotation if needed."""
     with _api_errors():
-        config = load_config()
+        config = _config()
         stored = load_tokens()
         if stored is None:
             _fail("not logged in; run 'tesla auth login'")
@@ -277,7 +483,9 @@ def auth_status() -> None:
 
         expires, rotated = asyncio.run(run())
     if rotated:
-        console.print("[green]Access token refreshed; rotation persisted.[/green]")
+        console.print(
+            "[green]Access token refreshed; rotation persisted.[/green]"
+        )
     else:
         console.print("[green]Access token is valid.[/green]")
     console.print(f"Expires {_format_expiry(expires)}")
@@ -292,7 +500,8 @@ def auth_logout() -> None:
         return
     path.unlink()
     console.print(
-        f"[green]Removed[/green] {path}. Run 'tesla auth login' to authorize again."
+        f"[green]Removed[/green] {escape(str(path))}. "
+        "Run 'tesla auth login' to authorize again."
     )
 
 
@@ -306,10 +515,11 @@ def notify() -> None:
 def notify_test(message: str) -> None:
     """Send a test notification using the configured ntfy topic."""
     with _api_errors():
-        config = load_config()
+        config = _config()
         if not config.notify.enabled:
             _fail(
-                "notifications are disabled; run 'tesla config set notify.enabled true'"
+                "notifications are disabled; run "
+                "'tesla config set notify.enabled true'"
             )
         try:
             notifier = build_notifier(config)
@@ -317,7 +527,9 @@ def notify_test(message: str) -> None:
             _fail(str(exc))
         if notifier is None:  # pragma: no cover - enabled checked above
             _fail("notifications are disabled")
-        ok = asyncio.run(notifier.send("test", message, title="tesla notify test"))
+        ok = asyncio.run(
+            notifier.send("test", message, title="tesla notify test")
+        )
     if not ok:
         _fail("failed to send; check the URL/topic and logs", 3)
     console.print("[green]notification sent[/green]")
@@ -329,7 +541,7 @@ def notify_reset() -> None:
     path = notify_state_path()
     if path.exists():
         path.unlink()
-        console.print(f"[green]Cleared[/green] {path}")
+        console.print(f"[green]Cleared[/green] {escape(str(path))}")
     else:
         console.print("No notification state to clear.")
 
@@ -338,12 +550,12 @@ def notify_reset() -> None:
 def products() -> None:
     """List vehicles and energy sites on the account."""
     with _api_errors():
-        config = load_config()
+        config = _config()
         stored = load_tokens()
         if stored is None:
             _fail("not logged in; run 'tesla auth login'")
 
-        async def run() -> dict:
+        async def run() -> dict[str, Any]:
             async with oauth_client(
                 credentials=load_credentials(), config=config, stored=stored
             ) as oauth:
@@ -354,7 +566,10 @@ def products() -> None:
     _render_products(data)
 
 
-def _render_powerwall(live: dict, info: dict | None = None) -> None:
+def _render_powerwall(
+    live: dict[str, Any],
+    info: dict[str, Any] | None = None,
+) -> None:
     pct = percentage_charged(live)
     reserve = backup_reserve(info or {})
     if reserve is None:
@@ -363,11 +578,14 @@ def _render_powerwall(live: dict, info: dict | None = None) -> None:
     table = Table(title="Powerwall")
     table.add_column("Field")
     table.add_column("Value")
-    table.add_row("Battery", f"{pct:.1f}%" if pct is not None else "unavailable")
     table.add_row(
-        "Backup reserve", f"{reserve:.0f}%" if reserve is not None else "unavailable"
+        "Battery", f"{pct:.1f}%" if pct is not None else "unavailable"
     )
-    table.add_row("Grid status", grid or "unavailable")
+    table.add_row(
+        "Backup reserve",
+        f"{reserve:.0f}%" if reserve is not None else "unavailable",
+    )
+    table.add_row("Grid status", escape(grid or "unavailable"))
     console.print(table)
 
 
@@ -388,7 +606,9 @@ def _format_clock_time(timestamp: float) -> str:
     return f"{hour}:{moment.minute:02d}{meridiem}"
 
 
-def _estimate_eta(history: list[tuple[float, float]], level: float) -> float | None:
+def _estimate_eta(
+    history: list[tuple[float, float]], level: float
+) -> float | None:
     """Least-squares extrapolation to ``level``; None when not rising."""
     if len(history) < 2:
         return None
@@ -400,20 +620,22 @@ def _estimate_eta(history: list[tuple[float, float]], level: float) -> float | N
     variance = sum((t - mean_t) ** 2 for t, _ in history)
     if variance == 0:
         return None
-    slope = sum((t - mean_t) * (pct - mean_pct) for t, pct in history) / variance
+    slope = (
+        sum((t - mean_t) * (pct - mean_pct) for t, pct in history) / variance
+    )
     if slope <= 0:
         return None
     return last_t + (level - last_pct) / slope
 
 
 async def _notify_on_level(
-    notifier,
-    read_pct,
+    notifier: NtfyNotifier,
+    read_pct: Callable[[], Awaitable[float | None]],
     *,
     level: float,
     interval: float,
-    sleep=None,
-    clock=None,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> None:
     """Poll the level and notify once per crossing of ``level``.
 
@@ -434,7 +656,9 @@ async def _notify_on_level(
             if pct >= level:
                 history.clear()
                 if not notified:
-                    LOGGER.info("Powerwall reached %g%%; sending notification", level)
+                    LOGGER.info(
+                        "Powerwall reached %g%%; sending notification", level
+                    )
                     notified = await notifier.send(
                         "powerwall_level",
                         f"Powerwall reached {level:g}%",
@@ -449,11 +673,15 @@ async def _notify_on_level(
                 eta_text = f"; eta: {_format_clock_time(eta)}" if eta else ""
                 if notified:
                     LOGGER.info(
-                        "Powerwall dropped to %.1f%%; notification re-armed", pct
+                        "Powerwall dropped to %.1f%%; notification re-armed",
+                        pct,
                     )
                 else:
                     LOGGER.info(
-                        "Powerwall at %.1f%%; waiting for %g%%%s", pct, level, eta_text
+                        "Powerwall at %.1f%%; waiting for %g%%%s",
+                        pct,
+                        level,
+                        eta_text,
                     )
                 notified = False
         next_interval = idle_interval if notified else interval
@@ -481,7 +709,7 @@ async def _notify_on_level(
 def powerwall_status(watch: bool, interval: int) -> None:
     """Show battery percentage, reserve, and grid status."""
     with _api_errors():
-        config = load_config()
+        config = _config()
         site_id = config.powerwall.energy_site_id
         if site_id is None:
             _fail(
@@ -500,7 +728,9 @@ def powerwall_status(watch: bool, interval: int) -> None:
                 site = oauth.energySites.create(site_id)
                 while True:
                     await ensure_fresh_token(oauth)
-                    _render_powerwall(await site.live_status(), await site.site_info())
+                    _render_powerwall(
+                        await site.live_status(), await site.site_info()
+                    )
                     if not watch:
                         return
                     await asyncio.sleep(interval)
@@ -531,7 +761,7 @@ def powerwall_notify(level: float, interval: int) -> None:
     """Watch the Powerwall and notify once per cycle at LEVEL%."""
     logging.getLogger("tesla.cli").setLevel(logging.INFO)
     with _api_errors():
-        config = load_config()
+        config = _config()
         site_id = config.powerwall.energy_site_id
         if site_id is None:
             _fail(
@@ -540,7 +770,8 @@ def powerwall_notify(level: float, interval: int) -> None:
             )
         if not config.notify.enabled:
             _fail(
-                "notifications are disabled; run 'tesla config set notify.enabled true'"
+                "notifications are disabled; run "
+                "'tesla config set notify.enabled true'"
             )
         try:
             notifier = build_notifier(config)
@@ -573,7 +804,10 @@ def powerwall_notify(level: float, interval: int) -> None:
             console.print("stopped")
 
 
-def _render_car(data: dict, settings: ChargeOnSolarSettings | None = None) -> None:
+def _render_car(
+    data: dict[str, Any],
+    settings: ChargeOnSolarSettings | None = None,
+) -> None:
     state = charge_state(data)
     if state is None:
         _fail("vehicle did not return charge state (asleep or offline?)", 3)
@@ -581,17 +815,25 @@ def _render_car(data: dict, settings: ChargeOnSolarSettings | None = None) -> No
     table.add_column("Field")
     table.add_column("Value")
     battery = state.get("battery_level")
-    table.add_row("Battery", f"{battery}%" if battery is not None else "unavailable")
+    table.add_row(
+        "Battery", f"{battery}%" if battery is not None else "unavailable"
+    )
     range_value = state.get("battery_range")
     table.add_row(
-        "Range", f"{range_value} mi" if range_value is not None else "unavailable"
+        "Range",
+        f"{range_value} mi" if range_value is not None else "unavailable",
     )
-    table.add_row("Charging state", str(state.get("charging_state", "unknown")))
+    table.add_row(
+        "Charging state",
+        escape(str(state.get("charging_state", "unknown"))),
+    )
     plugged = is_plugged(data)
     plugged_text = {None: "unknown", True: "yes", False: "no"}[plugged]
     table.add_row("Plugged in", plugged_text)
     limit = state.get("charge_limit_soc")
-    table.add_row("Charge limit", f"{limit}%" if limit is not None else "unavailable")
+    table.add_row(
+        "Charge limit", f"{limit}%" if limit is not None else "unavailable"
+    )
     status = vehicle_status(data)
     if settings is None:
         cos_text = "unknown"
@@ -602,17 +844,24 @@ def _render_car(data: dict, settings: ChargeOnSolarSettings | None = None) -> No
         detail = status.cos_state
         if status.cos_reason:
             detail += f" ({status.cos_reason})"
-        table.add_row("CoS state", detail)
+        table.add_row("CoS state", escape(detail))
     if settings is not None and (
         settings.lower_limit is not None or settings.upper_limit is not None
     ):
-        lower = "?" if settings.lower_limit is None else f"{settings.lower_limit:g}"
-        upper = "?" if settings.upper_limit is None else f"{settings.upper_limit:g}"
+        lower = (
+            "?" if settings.lower_limit is None else f"{settings.lower_limit:g}"
+        )
+        upper = (
+            "?" if settings.upper_limit is None else f"{settings.upper_limit:g}"
+        )
         table.add_row("CoS limits", f"{lower}% to {upper}%")
     console.print(table)
 
 
-async def _read_car_data(vehicle, config: Config) -> dict:
+async def _read_car_data(  # noqa: ANN401
+    vehicle: Any,  # noqa: ANN401
+    config: Config,
+) -> dict[str, Any]:
     """Read charge state, waking the vehicle once when it is asleep."""
     try:
         return await vehicle.vehicle_data(endpoints=["charge_state"])
@@ -634,7 +883,7 @@ def car_status() -> None:
     """Show battery, charging state, plug status, charge limit, and CoS."""
     logging.getLogger("tesla.cli").setLevel(logging.INFO)
     with _api_errors():
-        config = load_config()
+        config = _config()
         vin = config.vehicle.vin
         if not vin:
             _fail("no VIN set; run 'tesla config set vehicle.vin <vin>'")
@@ -643,7 +892,7 @@ def car_status() -> None:
         if stored is None:
             _fail("not logged in; run 'tesla auth login'")
 
-        async def run() -> tuple[dict, ChargeOnSolarSettings | None]:
+        async def run() -> tuple[dict[str, Any], ChargeOnSolarSettings | None]:
             async with oauth_client(
                 credentials=credentials, config=config, stored=stored
             ) as oauth:
@@ -655,7 +904,9 @@ def car_status() -> None:
                     await oauth.get_private_key(str(key_path(config)))
                     signed = oauth.vehicles.createSigned(vin)
                     try:
-                        settings = read_cos_settings(await signed.get_charge_on_solar())
+                        settings = read_cos_settings(
+                            await signed.get_charge_on_solar()
+                        )
                     except TeslaFleetError:
                         settings = None
                 return data, settings
@@ -665,7 +916,7 @@ def car_status() -> None:
 
 
 def _car_context() -> tuple[Config, Credentials, Tokens]:
-    config = load_config()
+    config = _config()
     if config.vehicle.vin is None:
         _fail("no VIN set; run 'tesla config set vehicle.vin <vin>'")
     credentials = load_credentials()
@@ -679,13 +930,20 @@ async def _send_manual_notification(config: Config, message: str) -> None:
     try:
         notifier = build_notifier(config)
     except NotifyError as exc:
-        err_console.print(f"[yellow]notify:[/yellow] {exc}")
+        err_console.print(f"[yellow]notify:[/yellow] {escape(str(exc))}")
         return
     if notifier is not None:
         await notifier.send("manual", message, priority=3, tags=("wrench",))
 
 
-async def _car_action(config, credentials, stored, action, *, notify_message):
+async def _car_action(  # noqa: ANN401
+    config: Config,
+    credentials: Credentials,
+    stored: Tokens,
+    action: Callable[[Any], Awaitable[Any]],
+    *,
+    notify_message: str,
+) -> Any:  # noqa: ANN401
     """Wake the vehicle, run one command on it, and return the response."""
     async with oauth_client(
         credentials=credentials, config=config, stored=stored
@@ -721,7 +979,7 @@ def car_charge_start() -> None:
         )
     console.print("[green]charge_start sent[/green]")
     if result:
-        console.print(str(result))
+        console.print(escape(str(result)))
 
 
 @car_charge.command("stop")
@@ -740,7 +998,7 @@ def car_charge_stop() -> None:
         )
     console.print("[green]charge_stop sent[/green]")
     if result:
-        console.print(str(result))
+        console.print(escape(str(result)))
 
 
 @car_charge.command("limit")
@@ -760,7 +1018,7 @@ def car_charge_limit(percent: int) -> None:
         )
     console.print(f"[green]set_charge_limit {percent}% sent[/green]")
     if result:
-        console.print(str(result))
+        console.print(escape(str(result)))
 
 
 @cli.command()
@@ -771,11 +1029,14 @@ def doctor() -> None:
     credentials: Credentials | None = None
     stored: Tokens | None = None
 
-    try:
-        config = load_config()
+    state = _state()
+    if state.config is not None:
+        config = state.config
         rows.append(("config", True, f"region={config.region}"))
-    except ConfigError as exc:
-        rows.append(("config", False, str(exc)))
+    else:
+        rows.append(
+            ("config", False, state.config_error or "invalid configuration")
+        )
 
     try:
         credentials = load_credentials()
@@ -786,7 +1047,9 @@ def doctor() -> None:
     try:
         stored = load_tokens()
         if stored is None:
-            rows.append(("tokens", False, "not logged in; run 'tesla auth login'"))
+            rows.append(
+                ("tokens", False, "not logged in; run 'tesla auth login'")
+            )
         else:
             rows.append(("tokens", True, "refresh token present"))
     except TokenError as exc:
@@ -821,7 +1084,7 @@ def doctor() -> None:
     api_failed = False
     if config is not None and credentials is not None and stored is not None:
 
-        async def fetch_products():
+        async def fetch_products() -> dict[str, Any]:
             async with oauth_client(
                 credentials=credentials, config=config, stored=stored
             ) as oauth:
@@ -830,14 +1093,23 @@ def doctor() -> None:
 
         try:
             data = asyncio.run(fetch_products())
-        except (AuthError, LibraryError, TeslaFleetError, aiohttp.ClientError) as exc:
+        except (
+            AuthError,
+            LibraryError,
+            TeslaFleetError,
+            aiohttp.ClientError,
+        ) as exc:
             api_failed = True
             rows.append(("api", False, str(exc)))
         else:
-            items = [i for i in (data.get("response") or []) if isinstance(i, dict)]
+            items = [
+                i for i in (data.get("response") or []) if isinstance(i, dict)
+            ]
             vins = {i.get("vin") for i in items}
             sites = {i.get("energy_site_id") for i in items}
-            rows.append(("api", True, f"{len(vins)} vehicles, {len(sites)} sites"))
+            rows.append(
+                ("api", True, f"{len(vins)} vehicles, {len(sites)} sites")
+            )
             if config.vehicle.vin:
                 rows.append(
                     (
@@ -862,7 +1134,11 @@ def doctor() -> None:
     failed = False
     for name, ok, detail in rows:
         failed = failed or not ok
-        table.add_row(name, "[green]ok[/green]" if ok else "[red]fail[/red]", detail)
+        table.add_row(
+            escape(name),
+            "[green]ok[/green]" if ok else "[red]fail[/red]",
+            escape(detail),
+        )
     console.print(table)
     if failed:
         raise SystemExit(3 if api_failed else 2)
@@ -891,7 +1167,7 @@ def auto_charge(
     """Watch the Powerwall and start charging once at the threshold."""
     logging.getLogger("tesla.auto_charge").setLevel(logging.INFO)
     with _api_errors():
-        config = load_config()
+        config = _config()
         if threshold is not None:
             config.auto_charge.threshold = threshold
         if interval is not None:
@@ -925,7 +1201,11 @@ def auto_charge(
                 client = TeslaAutoChargeClient(oauth, config)
                 await client.build()
                 return await run_auto_charge(
-                    client, config, dry_run=dry_run, once=once, notifier=notifier
+                    client,
+                    config,
+                    dry_run=dry_run,
+                    once=once,
+                    notifier=notifier,
                 )
 
         try:
@@ -955,15 +1235,17 @@ def key() -> None:
 def key_generate(pem_only: bool) -> None:
     """Create the EC P-256 private key and print the public PEM."""
     with _api_errors():
-        config = load_config()
+        config = _config()
         path, public_pem = asyncio.run(generate_key(config))
     if pem_only:
         click.echo(public_pem, nl=False)
         return
-    console.print(f"Private key written to [bold]{path}[/bold] (mode 0600).")
+    console.print(
+        f"Private key written to [bold]{escape(str(path))}[/bold] (mode 0600)."
+    )
     console.print("Host this public key at (exactly, permanently):")
     target = config.domain or "YOUR_DOMAIN"
-    console.print(f"  [bold]https://{target}{HOSTED_KEY_PATH}[/bold]")
+    console.print(f"  [bold]https://{escape(target)}{HOSTED_KEY_PATH}[/bold]")
     click.echo(public_pem, nl=False)
 
 
@@ -974,30 +1256,33 @@ def key_generate(pem_only: bool) -> None:
 def key_register(domain: str | None) -> None:
     """Register the partner domain with Tesla; host the key first."""
     with _api_errors():
-        config = load_config()
+        config = _config()
         domain = domain or config.domain
         if not domain:
             _fail(
-                "no domain set; run 'tesla config set domain <domain>' or pass --domain"
+                "no domain set; run 'tesla config set domain <domain>' "
+                "or pass --domain"
             )
         credentials = load_credentials()
 
-        async def run() -> dict:
-            async with oauth_client(credentials=credentials, config=config) as oauth:
+        async def run() -> dict[str, Any]:
+            async with oauth_client(
+                credentials=credentials, config=config
+            ) as oauth:
                 return await register_domain(oauth, credentials, domain)
 
         result = asyncio.run(run())
-    console.print(f"[green]Registered[/green] {domain} with Tesla.")
+    console.print(f"[green]Registered[/green] {escape(domain)} with Tesla.")
     response = result.get("response")
     if response:
-        console.print(str(response))
+        console.print(escape(str(response)))
 
 
 @key.command("status")
 def key_status() -> None:
     """Compare local, Tesla-registered, and hosted public keys."""
     with _api_errors():
-        config = load_config()
+        config = _config()
         domain = config.domain
         if not domain:
             _fail("no domain set; run 'tesla config set domain <domain>'")
@@ -1008,18 +1293,22 @@ def key_status() -> None:
             _fail("could not read the local public key")
 
         async def run() -> tuple[str | None, str | None]:
-            async with oauth_client(credentials=credentials, config=config) as oauth:
-                registered = await registered_public_key(oauth, credentials, domain)
+            async with oauth_client(
+                credentials=credentials, config=config
+            ) as oauth:
+                registered = await registered_public_key(
+                    oauth, credentials, domain
+                )
             hosted = await fetch_hosted_key(domain)
             return registered, hosted
 
         registered, hosted = asyncio.run(run())
         vin = config.vehicle.vin
         stored = load_tokens()
-        fleet_result: dict | None = None
+        fleet_result: dict[str, Any] | None = None
         if vin and stored is not None:
 
-            async def run_fleet() -> dict:
+            async def run_fleet() -> dict[str, Any]:
                 async with oauth_client(
                     credentials=credentials, config=config, stored=stored
                 ) as oauth:
@@ -1032,7 +1321,7 @@ def key_status() -> None:
             except TeslaFleetError as exc:
                 fleet_result = {"error": str(exc)}
 
-    table = Table(title=f"Key status for {domain}")
+    table = Table(title=f"Key status for {escape(domain)}")
     table.add_column("Source")
     table.add_column("Status")
     table.add_row("local private key", "[green]present[/green]")
@@ -1041,11 +1330,13 @@ def key_status() -> None:
     console.print(table)
     if fleet_result is not None:
         console.print(
-            f"Vehicle fleet status: {fleet_result.get('response', fleet_result)}"
+            "Vehicle fleet status: "
+            f"{escape(str(fleet_result.get('response', fleet_result)))}"
         )
     elif vin:
         console.print(
-            "Vehicle fleet status: skipped (no user tokens; run 'tesla auth login')"
+            "Vehicle fleet status: skipped "
+            "(no user tokens; run 'tesla auth login')"
         )
     else:
         console.print("Vehicle fleet status: skipped (no VIN configured)")
@@ -1059,11 +1350,7 @@ def config() -> None:
 @config.command("show")
 def config_show() -> None:
     """Print the effective configuration."""
-    try:
-        current = load_config()
-    except ConfigError as exc:
-        _fail(str(exc))
-    click.echo(dump_toml(current), nl=False)
+    click.echo(dump_toml(_config()), nl=False)
 
 
 @config.command("set")
@@ -1071,13 +1358,13 @@ def config_show() -> None:
 @click.argument("value")
 def config_set(key: str, value: str) -> None:
     """Set dotted KEY (e.g. auto_charge.threshold) to VALUE."""
+    current = _config()
     try:
-        current = load_config()
         set_dotted(current, key, value)
         save_config(current)
     except ConfigError as exc:
         _fail(str(exc))
-    console.print(f"[green]set[/green] {key} = {value}")
+    console.print(f"[green]set[/green] {escape(key)} = {escape(value)}")
 
 
 def main() -> None:

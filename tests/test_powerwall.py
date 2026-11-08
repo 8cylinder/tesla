@@ -2,7 +2,9 @@ from tesla.powerwall import backup_reserve, grid_status, percentage_charged
 
 
 def test_percentage_direct():
-    assert percentage_charged({"response": {"percentage_charged": 73.5}}) == 73.5
+    assert (
+        percentage_charged({"response": {"percentage_charged": 73.5}}) == 73.5
+    )
 
 
 def test_percentage_direct_wins_over_ratio():

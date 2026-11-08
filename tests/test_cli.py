@@ -1,6 +1,8 @@
 import contextlib
 import stat
+import tomllib
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -13,10 +15,7 @@ from tesla.tokens import Tokens, load_tokens, save_tokens
 
 def invoke(config_dir, *args, env=None):
     runner = CliRunner()
-    full_env = {"TESLA_CONFIG_DIR": str(config_dir)}
-    if env:
-        full_env.update(env)
-    return runner.invoke(cli, list(args), env=full_env)
+    return runner.invoke(cli, list(args), env=env)
 
 
 def combined(result):
@@ -91,9 +90,15 @@ def test_products_without_tokens_exits_2(config_dir):
     assert "tesla auth login" in combined(result)
 
 
-def test_auth_login_missing_credentials_exits_2(config_dir, tmp_path, monkeypatch):
+def test_auth_login_missing_credentials_exits_2(
+    config_dir, tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
-    for name in ("TESLA_CLIENT_ID", "TESLA_CLIENT_SECRET", "TESLA_REDIRECT_URI"):
+    for name in (
+        "TESLA_CLIENT_ID",
+        "TESLA_CLIENT_SECRET",
+        "TESLA_REDIRECT_URI",
+    ):
         monkeypatch.delenv(name, raising=False)
     result = invoke(config_dir, "auth", "login")
     assert result.exit_code == 2
@@ -121,9 +126,15 @@ def test_key_register_without_domain_exits_2(config_dir):
     assert "no domain" in combined(result)
 
 
-def test_key_register_without_credentials_exits_2(config_dir, tmp_path, monkeypatch):
+def test_key_register_without_credentials_exits_2(
+    config_dir, tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
-    for name in ("TESLA_CLIENT_ID", "TESLA_CLIENT_SECRET", "TESLA_REDIRECT_URI"):
+    for name in (
+        "TESLA_CLIENT_ID",
+        "TESLA_CLIENT_SECRET",
+        "TESLA_REDIRECT_URI",
+    ):
         monkeypatch.delenv(name, raising=False)
     result = invoke(config_dir, "key", "register", "--domain", "example.com")
     assert result.exit_code == 2
@@ -155,7 +166,9 @@ def test_powerwall_status_without_site_id_exits_2(config_dir):
 
 
 def test_powerwall_status_without_tokens_exits_2(config_dir):
-    result = invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123")
+    result = invoke(
+        config_dir, "config", "set", "powerwall.energy_site_id", "123"
+    )
     assert result.exit_code == 0
     result = invoke(config_dir, "powerwall", "status")
     assert result.exit_code == 2
@@ -170,7 +183,9 @@ def test_powerwall_notify_without_site_id_exits_2(config_dir):
 
 def test_powerwall_notify_disabled_exits_2(config_dir):
     assert (
-        invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123").exit_code
+        invoke(
+            config_dir, "config", "set", "powerwall.energy_site_id", "123"
+        ).exit_code
         == 0
     )
     result = invoke(config_dir, "powerwall", "notify")
@@ -178,13 +193,20 @@ def test_powerwall_notify_disabled_exits_2(config_dir):
     assert "disabled" in combined(result)
 
 
-def test_powerwall_notify_missing_topic_exits_2(config_dir, tmp_path, monkeypatch):
+def test_powerwall_notify_missing_topic_exits_2(
+    config_dir, tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     assert (
-        invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123").exit_code
+        invoke(
+            config_dir, "config", "set", "powerwall.energy_site_id", "123"
+        ).exit_code
         == 0
     )
-    assert invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code == 0
+    assert (
+        invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code
+        == 0
+    )
     monkeypatch.delenv("TESLA_NTFY_TOPIC", raising=False)
     result = invoke(config_dir, "powerwall", "notify")
     assert result.exit_code == 2
@@ -193,12 +215,20 @@ def test_powerwall_notify_missing_topic_exits_2(config_dir, tmp_path, monkeypatc
 
 def test_powerwall_notify_without_tokens_exits_2(config_dir):
     assert (
-        invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123").exit_code
+        invoke(
+            config_dir, "config", "set", "powerwall.energy_site_id", "123"
+        ).exit_code
         == 0
     )
-    assert invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code == 0
+    assert (
+        invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code
+        == 0
+    )
     result = invoke(
-        config_dir, "powerwall", "notify", env={"TESLA_NTFY_TOPIC": "test-topic"}
+        config_dir,
+        "powerwall",
+        "notify",
+        env={"TESLA_NTFY_TOPIC": "test-topic"},
     )
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
@@ -496,9 +526,14 @@ def car_status_env():
 
 
 def prepare_car_status(config_dir, wake_timeout=None):
-    assert invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code == 0
     assert (
-        invoke(config_dir, "config", "set", "vehicle.command_mode", "fleet").exit_code
+        invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code
+        == 0
+    )
+    assert (
+        invoke(
+            config_dir, "config", "set", "vehicle.command_mode", "fleet"
+        ).exit_code
         == 0
     )
     if wake_timeout is not None:
@@ -542,16 +577,24 @@ def test_auto_charge_without_vin_exits_2(config_dir):
 
 
 def test_auto_charge_without_site_id_exits_2(config_dir):
-    assert invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code == 0
+    assert (
+        invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code
+        == 0
+    )
     result = invoke(config_dir, "auto-charge", "--once")
     assert result.exit_code == 2
     assert "energy_site_id" in combined(result)
 
 
 def test_auto_charge_without_tokens_exits_2(config_dir):
-    assert invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code == 0
     assert (
-        invoke(config_dir, "config", "set", "powerwall.energy_site_id", "123").exit_code
+        invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code
+        == 0
+    )
+    assert (
+        invoke(
+            config_dir, "config", "set", "powerwall.energy_site_id", "123"
+        ).exit_code
         == 0
     )
     result = invoke(config_dir, "auto-charge", "--once")
@@ -565,7 +608,10 @@ def test_car_charge_limit_out_of_range_exits_2(config_dir):
 
 
 def test_car_charge_start_without_tokens_exits_2(config_dir):
-    assert invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code == 0
+    assert (
+        invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code
+        == 0
+    )
     result = invoke(config_dir, "car", "charge", "start")
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
@@ -573,7 +619,11 @@ def test_car_charge_start_without_tokens_exits_2(config_dir):
 
 def test_doctor_missing_credentials_exits_2(config_dir, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    for name in ("TESLA_CLIENT_ID", "TESLA_CLIENT_SECRET", "TESLA_REDIRECT_URI"):
+    for name in (
+        "TESLA_CLIENT_ID",
+        "TESLA_CLIENT_SECRET",
+        "TESLA_REDIRECT_URI",
+    ):
         monkeypatch.delenv(name, raising=False)
     result = invoke(config_dir, "doctor")
     assert result.exit_code == 2
@@ -590,7 +640,10 @@ def test_notify_test_disabled_exits_2(config_dir):
 
 def test_notify_test_missing_topic_exits_2(config_dir, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    assert invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code == 0
+    assert (
+        invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code
+        == 0
+    )
     monkeypatch.delenv("TESLA_NTFY_TOPIC", raising=False)
     result = invoke(config_dir, "notify", "test")
     assert result.exit_code == 2
@@ -608,7 +661,10 @@ def test_notify_test_sends(config_dir, monkeypatch):
 
     notifier = FakeNotifier()
     monkeypatch.setattr("tesla.cli.build_notifier", lambda config: notifier)
-    assert invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code == 0
+    assert (
+        invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code
+        == 0
+    )
     result = invoke(config_dir, "notify", "test")
     assert result.exit_code == 0
     assert notifier.stages == ["test"]
@@ -623,3 +679,166 @@ def test_notify_reset_clears_state(config_dir):
     result = invoke(config_dir, "notify", "reset")
     assert result.exit_code == 0
     assert "No notification state to clear" in result.output
+
+
+def _command_paths(command, prefix=()):
+    paths = [prefix]
+    if hasattr(command, "list_commands"):
+        import click
+
+        ctx = click.Context(command)
+        for name in command.list_commands(ctx):
+            child = command.get_command(ctx, name)
+            if child is not None and not child.hidden:
+                paths.extend(_command_paths(child, prefix + (name,)))
+    return paths
+
+
+def test_config_flag_prints_path_and_creates_nothing(config_dir):
+    result = invoke(config_dir, "--config")
+    assert result.exit_code == 0
+    assert result.output.strip() == str(config_dir / "config.toml")
+    assert "\x1b[" not in result.output
+    assert not (config_dir / "config.toml").exists()
+
+
+def test_unknown_config_key_warns(config_dir):
+    (config_dir / "config.toml").write_text("bogus = 1\n")
+    result = invoke(config_dir, "config", "show")
+    assert result.exit_code == 0
+    assert "ignoring unknown config key" in combined(result)
+    assert "bogus = 1" not in result.output
+
+
+def test_invalid_toml_exits_and_names_path(config_dir):
+    path = config_dir / "config.toml"
+    path.write_text("not = [valid\n")
+    result = invoke(config_dir, "config", "show")
+    assert result.exit_code == 2
+    assert "invalid TOML" in combined(result)
+    assert "config.tom" in combined(result)
+
+
+def test_doctor_reports_invalid_config(config_dir):
+    (config_dir / "config.toml").write_text("not = [valid\n")
+    result = invoke(config_dir, "doctor")
+    assert result.exit_code != 0
+    assert "config" in result.output
+    assert "invalid TOML" in result.output
+
+
+def test_color_always_emits_ansi(config_dir):
+    result = invoke(
+        config_dir,
+        "--color",
+        "always",
+        "config",
+        "set",
+        "auto_charge.threshold",
+        "90",
+    )
+    assert result.exit_code == 0
+    assert "\x1b[" in combined(result)
+
+
+def test_color_never_emits_no_ansi(config_dir):
+    result = invoke(
+        config_dir,
+        "--color",
+        "never",
+        "config",
+        "set",
+        "auto_charge.threshold",
+        "90",
+    )
+    assert result.exit_code == 0
+    assert "\x1b[" not in combined(result)
+
+
+def test_color_auto_emits_no_ansi_when_captured(config_dir):
+    result = invoke(config_dir, "config", "set", "auto_charge.threshold", "90")
+    assert result.exit_code == 0
+    assert "\x1b[" not in combined(result)
+
+
+def test_force_color_emits_ansi(config_dir):
+    result = invoke(
+        config_dir,
+        "config",
+        "set",
+        "auto_charge.threshold",
+        "90",
+        env={"FORCE_COLOR": "1", "NO_COLOR": ""},
+    )
+    assert result.exit_code == 0
+    assert "\x1b[" in combined(result)
+
+
+def test_no_color_suppresses_ansi(config_dir):
+    result = invoke(
+        config_dir,
+        "config",
+        "set",
+        "auto_charge.threshold",
+        "90",
+        env={"NO_COLOR": "1", "FORCE_COLOR": ""},
+    )
+    assert result.exit_code == 0
+    assert "\x1b[" not in combined(result)
+
+
+def test_term_dumb_suppresses_ansi(config_dir):
+    result = invoke(
+        config_dir,
+        "config",
+        "set",
+        "auto_charge.threshold",
+        "90",
+        env={"TERM": "dumb", "FORCE_COLOR": ""},
+    )
+    assert result.exit_code == 0
+    assert "\x1b[" not in combined(result)
+
+
+def test_user_markup_is_escaped(config_dir):
+    result = invoke(
+        config_dir, "config", "set", "auto_charge.threshold", "[red]high"
+    )
+    assert result.exit_code == 2
+    assert "[red]high" in combined(result)
+
+
+def test_errors_go_to_stderr(config_dir):
+    result = invoke(config_dir, "config", "set", "nope", "1")
+    assert result.exit_code == 2
+    assert "unknown key" in result.stderr
+    assert "unknown key" not in result.stdout
+
+
+def test_version_matches_pyproject(config_dir):
+    root = Path(__file__).resolve().parent.parent
+    with (root / "pyproject.toml").open("rb") as handle:
+        version = tomllib.load(handle)["project"]["version"]
+    assert version == __version__
+
+
+def test_version_output_is_plain(config_dir):
+    result = invoke(config_dir, "--version")
+    assert result.exit_code == 0
+    assert result.output.strip() == f"tesla, version {__version__}"
+    assert "\x1b[" not in result.output
+
+
+def test_help_works_for_every_command(config_dir):
+    for path in _command_paths(cli):
+        for flag in ("-h", "--help"):
+            result = invoke(config_dir, *path, flag)
+            assert result.exit_code == 0, (path, flag, result.output)
+            assert "Usage:" in result.output
+            assert "\x1b[" not in result.output
+
+
+def test_no_args_shows_help(config_dir):
+    result = invoke(config_dir)
+    assert result.exit_code == 2
+    assert "Usage:" in result.output

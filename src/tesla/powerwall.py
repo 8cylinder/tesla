@@ -10,7 +10,7 @@ def _response(data: dict[str, Any]) -> dict[str, Any]:
     return response if isinstance(response, dict) else {}
 
 
-def _number(value: Any) -> float | None:
+def _number(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     return None

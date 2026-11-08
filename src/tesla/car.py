@@ -105,7 +105,7 @@ def charge_on_solar_reason(vehicle_data: dict[str, Any]) -> str | None:
     reason = blocked.get("reason")
     if not isinstance(reason, str):
         return None
-    return reason.removeprefix(_REASON_PREFIX)
+    return str(reason).removeprefix(_REASON_PREFIX)
 
 
 def vehicle_status(vehicle_data: dict[str, Any]) -> VehicleStatus:
@@ -117,20 +117,24 @@ def vehicle_status(vehicle_data: dict[str, Any]) -> VehicleStatus:
     )
 
 
-def _number(value: Any) -> float | None:
+def _number(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     return None
 
 
-def _find_feature(data: Any) -> dict[str, Any] | None:
+def _find_feature(data: object) -> dict[str, Any] | None:
     """Find the charge_on_solar feature at any nesting depth of a response."""
     if isinstance(data, dict):
         for key in ("charge_on_solar", "chargeOnSolar"):
             value = data.get(key)
             if isinstance(value, dict) and any(
                 marker in value
-                for marker in ("enabled", "lower_charge_limit", "lowerChargeLimit")
+                for marker in (
+                    "enabled",
+                    "lower_charge_limit",
+                    "lowerChargeLimit",
+                )
             ):
                 return value
         for value in data.values():
@@ -140,7 +144,7 @@ def _find_feature(data: Any) -> dict[str, Any] | None:
     return None
 
 
-def charge_on_solar_settings(data: Any) -> ChargeOnSolarSettings | None:
+def charge_on_solar_settings(data: object) -> ChargeOnSolarSettings | None:
     """Parse get_charge_on_solar(); tolerant of key casing and nesting."""
     feature = _find_feature(data)
     if feature is None:
