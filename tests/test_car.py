@@ -40,7 +40,9 @@ def test_charging_state():
 
 def test_is_plugged():
     assert is_plugged(VEHICLE) is True
-    disconnected = {"response": {"charge_state": {"charging_state": "Disconnected"}}}
+    disconnected = {
+        "response": {"charge_state": {"charging_state": "Disconnected"}}
+    }
     assert is_plugged(disconnected) is False
     assert is_plugged({}) is None
 
@@ -53,7 +55,10 @@ MANAGED = {
             "managed_charging_state": {
                 "charge_on_solar_state": {
                     "no_charge_recommended": {
-                        "reason": "CHARGE_ON_SOLAR_NO_CHARGE_REASON_INSUFFICIENT_SOLAR"
+                        "reason": (
+                            "CHARGE_ON_SOLAR_NO_CHARGE_REASON_"
+                            "INSUFFICIENT_SOLAR"
+                        )
                     }
                 },
                 "minutes_to_lower_limit": 12,
@@ -67,7 +72,8 @@ def test_battery_level():
     assert battery_level(VEHICLE) == 80
     assert battery_level({}) is None
     assert (
-        battery_level({"response": {"charge_state": {"battery_level": True}}}) is None
+        battery_level({"response": {"charge_state": {"battery_level": True}}})
+        is None
     )
 
 
@@ -88,7 +94,9 @@ def test_charge_on_solar_state_and_reason():
     plain = {
         "response": {
             "charge_state": {
-                "managed_charging_state": {"charge_on_solar_state": "user_stopped"}
+                "managed_charging_state": {
+                    "charge_on_solar_state": "user_stopped"
+                }
             }
         }
     }
@@ -116,7 +124,9 @@ def test_charge_on_solar_settings_nested_and_camel():
             }
         }
     }
-    assert charge_on_solar_settings(snake) == ChargeOnSolarSettings(True, 50.0, 80.0)
+    assert charge_on_solar_settings(snake) == ChargeOnSolarSettings(
+        True, 50.0, 80.0
+    )
     camel = {
         "chargeOnSolar": {
             "enabled": False,
@@ -124,6 +134,8 @@ def test_charge_on_solar_settings_nested_and_camel():
             "upperChargeLimit": 90,
         }
     }
-    assert charge_on_solar_settings(camel) == ChargeOnSolarSettings(False, 20.0, 90.0)
+    assert charge_on_solar_settings(camel) == ChargeOnSolarSettings(
+        False, 20.0, 90.0
+    )
     assert charge_on_solar_settings({}) is None
     assert charge_on_solar_settings(None) is None

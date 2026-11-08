@@ -6,7 +6,9 @@ __pycache__
 *.py[cod]
 .pytest_cache
 .ruff_cache
+.ty_cache
 .mypy_cache
+docs
 tests
 deploy
 scripts
@@ -18,3 +20,5 @@ dist
 .env.*
 *.pem
 TESLA.plan.org
+app-base.org
+*.plan.org

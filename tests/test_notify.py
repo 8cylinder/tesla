@@ -119,7 +119,9 @@ async def test_cooldown_suppresses_repeat(config_dir):
         return sum(len(session.posts) for session in FakeSession.instances)
 
     state = NotifyState(config_dir / "notify_state.json")
-    notifier = NtfyNotifier(make_config(enabled=True).notify, "topic", state=state)
+    notifier = NtfyNotifier(
+        make_config(enabled=True).notify, "topic", state=state
+    )
     assert await notifier.send("threshold", "one", cooldown=3600)
     assert await notifier.send("threshold", "two", cooldown=3600) is False
     assert total_posts() == 1
@@ -134,7 +136,9 @@ async def test_on_change_suppresses_same_situation(config_dir):
 
     notifier = NtfyNotifier(make_config(enabled=True).notify, "topic")
     assert await notifier.send("wait_plug", "one", on_change="wait_plug")
-    assert await notifier.send("wait_plug", "two", on_change="wait_plug") is False
+    assert (
+        await notifier.send("wait_plug", "two", on_change="wait_plug") is False
+    )
     assert total_posts() == 1
     notifier.note_situation("below_threshold")
     assert await notifier.send("wait_plug", "three", on_change="wait_plug")
@@ -153,7 +157,9 @@ async def test_verbose_bypasses_situation_and_cooldown(config_dir):
 async def test_failed_send_does_not_mark(config_dir):
     FakeSession.status = 500
     state = NotifyState(config_dir / "notify_state.json")
-    notifier = NtfyNotifier(make_config(enabled=True).notify, "topic", state=state)
+    notifier = NtfyNotifier(
+        make_config(enabled=True).notify, "topic", state=state
+    )
     assert await notifier.send("threshold", "one", cooldown=3600) is False
     FakeSession.status = 200
     assert await notifier.send("threshold", "two", cooldown=3600)

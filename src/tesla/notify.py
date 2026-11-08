@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import aiohttp
@@ -46,14 +47,17 @@ class NotifyState:
                 state = raw.get("state")
                 situation = state if isinstance(state, str) else None
                 stamp = raw.get("last_run")
-                if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+                if isinstance(stamp, (int, float)) and not isinstance(
+                    stamp, bool
+                ):
                     last_run = float(stamp)
                 entries = raw.get("sent")
             if isinstance(entries, dict):
                 sent = {
                     str(key): float(value)
                     for key, value in entries.items()
-                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
                 }
         self._situation = situation
         self._last_run = last_run
@@ -81,16 +85,19 @@ class NotifyState:
         if not cooldown:
             return True
         self._load()
+        assert self._sent is not None
         last = self._sent.get(stage)
         return last is None or (time.time() - last) >= cooldown
 
     def mark(self, stage: str) -> None:
         self._load()
+        assert self._sent is not None
         self._sent[stage] = time.time()
         self._save()
 
     def clear(self, *stages: str) -> None:
         self._load()
+        assert self._sent is not None
         for stage in stages:
             self._sent.pop(stage, None)
         self._save()
@@ -143,7 +150,9 @@ class NtfyNotifier:
         situation differs from that value; the situation is then updated.
         ``verbose`` disables both the situation check and cooldowns.
         """
-        effective_priority = priority if priority is not None else self.config.priority
+        effective_priority = (
+            priority if priority is not None else self.config.priority
+        )
         if effective_priority < self.config.min_priority:
             return False
         if not self.config.verbose:
@@ -193,14 +202,20 @@ class NtfyNotifier:
         self.state.touch()
 
     def _tags(self, extra: tuple[str, ...] | list[str]) -> list[str]:
-        tags = [tag.strip() for tag in self.config.tags.split(",") if tag.strip()]
+        tags = [
+            tag.strip() for tag in self.config.tags.split(",") if tag.strip()
+        ]
         for tag in extra:
             if tag and tag not in tags:
                 tags.append(tag)
         return tags
 
 
-def build_notifier(config: Config, *, environ=None) -> NtfyNotifier | None:
+def build_notifier(
+    config: Config,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> NtfyNotifier | None:
     """Build a notifier when enabled; topic/token come from env or .env."""
     if not config.notify.enabled:
         return None

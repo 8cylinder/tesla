@@ -1,8 +1,9 @@
 """Configuration paths, validation and persistence.
 
-State lives under ``~/.config/tesla`` unless ``TESLA_CONFIG_DIR`` overrides
-it. The TOML schema is deliberately small and strict: unknown keys and
-wrong types are rejected so typos surface immediately.
+State lives in the platform per-user config directory (``platformdirs``).
+The TOML schema is deliberately small and strict: wrong types are rejected
+so typos surface immediately. Unknown keys are warned about and ignored so
+older config files keep working after an upgrade.
 """
 
 from __future__ import annotations
@@ -10,10 +11,14 @@ from __future__ import annotations
 import os
 import tempfile
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import platformdirs
+
+APP = "tesla"
 COMMAND_MODES = ("signed", "fleet")
 REGIONS = ("na", "eu", "cn")
 
@@ -23,13 +28,12 @@ class ConfigError(Exception):
 
 
 def config_dir() -> Path:
-    override = os.environ.get("TESLA_CONFIG_DIR")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".config" / "tesla"
+    """Return the platform-specific per-user config directory."""
+    return Path(platformdirs.user_config_dir(APP)).expanduser().absolute()
 
 
 def config_path() -> Path:
+    """Return the absolute path of ``config.toml``."""
     return config_dir() / "config.toml"
 
 
@@ -88,13 +92,23 @@ class Config:
     powerwall: PowerwallConfig = field(default_factory=PowerwallConfig)
     auto_charge: AutoChargeConfig = field(default_factory=AutoChargeConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    source_path: Path | None = field(default=None, repr=False, compare=False)
 
 
 def key_path(config: Config) -> Path:
-    """Resolve the EC private key path (default: config dir)."""
-    if config.vehicle.key_path:
-        return Path(config.vehicle.key_path).expanduser()
-    return config_dir() / "private_key.pem"
+    """Resolve the EC private key path (default: config dir).
+
+    Relative values from ``config.toml`` are resolved against the config
+    file's parent directory, not the process working directory.
+    """
+    raw = config.vehicle.key_path
+    if not raw:
+        return config_dir() / "private_key.pem"
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        base = config.source_path.parent if config.source_path else Path.cwd()
+        path = base / path
+    return path
 
 
 _SCHEMA: dict[str, Any] = {
@@ -130,11 +144,14 @@ _SCHEMA: dict[str, Any] = {
 }
 
 
-def _type_name(expected: Any) -> str:
-    return "boolean" if expected is bool else expected.__name__
+def _type_name(expected: Any) -> str:  # noqa: ANN401
+    return "boolean" if expected is bool else str(expected.__name__)
 
 
-def _check_type(value: Any, expected: Any) -> bool:
+def _check_type(  # noqa: ANN401
+    value: Any,  # noqa: ANN401
+    expected: Any,  # noqa: ANN401
+) -> bool:
     if expected is bool:
         return isinstance(value, bool)
     if expected is int:
@@ -144,21 +161,32 @@ def _check_type(value: Any, expected: Any) -> bool:
     return isinstance(value, expected)
 
 
-def _validate(section: str, data: dict[str, Any], schema: dict[str, Any]) -> None:
+def _clean(
+    section: str,
+    data: dict[str, Any],
+    schema: dict[str, Any],
+    unknown: list[str],
+) -> dict[str, Any]:
     prefix = f"{section}." if section else ""
+    cleaned: dict[str, Any] = {}
     for key, value in data.items():
         expected = schema.get(key)
         full = f"{prefix}{key}"
         if expected is None:
-            raise ConfigError(f"unknown key {full!r}")
+            unknown.append(full)
+            continue
         if isinstance(expected, dict):
             if not isinstance(value, dict):
                 raise ConfigError(f"{full!r} must be a table")
-            _validate(full, value, expected)
+            cleaned[key] = _clean(full, value, expected, unknown)
         elif not _check_type(value, expected):
             raise ConfigError(
-                f"{full!r} must be {_type_name(expected)}, got {type(value).__name__}"
+                f"{full!r} must be {_type_name(expected)}, "
+                f"got {type(value).__name__}"
             )
+        else:
+            cleaned[key] = value
+    return cleaned
 
 
 def _check_values(config: Config) -> None:
@@ -192,26 +220,42 @@ def _check_values(config: Config) -> None:
         raise ConfigError("notify.url must not be empty")
 
 
-def _build(data: dict[str, Any]) -> Config:
-    _validate("", data, _SCHEMA)
-    config = Config(region=data.get("region", "na"), domain=data.get("domain"))
-    for key, value in (data.get("vehicle") or {}).items():
+def _build(
+    data: dict[str, Any],
+    path: Path,
+    unknown: list[str],
+) -> Config:
+    cleaned = _clean("", data, _SCHEMA, unknown)
+    config = Config(
+        region=cleaned.get("region", "na"),
+        domain=cleaned.get("domain"),
+        source_path=path,
+    )
+    for key, value in (cleaned.get("vehicle") or {}).items():
         setattr(config.vehicle, key, value)
-    for key, value in (data.get("powerwall") or {}).items():
+    for key, value in (cleaned.get("powerwall") or {}).items():
         setattr(config.powerwall, key, value)
-    for key, value in (data.get("auto_charge") or {}).items():
+    for key, value in (cleaned.get("auto_charge") or {}).items():
         setattr(config.auto_charge, key, value)
-    for key, value in (data.get("notify") or {}).items():
+    for key, value in (cleaned.get("notify") or {}).items():
         setattr(config.notify, key, value)
     _check_values(config)
     return config
 
 
-def load_config(path: Path | None = None) -> Config:
-    """Load and validate config.toml; missing file yields defaults."""
+def load_config(
+    path: Path | None = None,
+    *,
+    on_unknown: Callable[[str], None] | None = None,
+) -> Config:
+    """Load and validate config.toml; a missing file yields defaults.
+
+    Unknown keys are reported through ``on_unknown`` and ignored. Invalid
+    TOML and wrong types raise :class:`ConfigError` naming the file.
+    """
     path = path or config_path()
     if not path.exists():
-        return Config()
+        return Config(source_path=path)
     try:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
@@ -219,10 +263,15 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError(f"{path}: invalid TOML: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
-    return _build(data)
+    unknown: list[str] = []
+    config = _build(data, path, unknown)
+    if on_unknown is not None:
+        for key in unknown:
+            on_unknown(key)
+    return config
 
 
-def _schema_for(dotted: str) -> Any:
+def _schema_for(dotted: str) -> Any:  # noqa: ANN401
     parts = dotted.split(".")
     if len(parts) == 1:
         expected = _SCHEMA.get(parts[0])
@@ -234,7 +283,7 @@ def _schema_for(dotted: str) -> Any:
     return None
 
 
-def get_dotted(config: Config, dotted: str) -> Any:
+def get_dotted(config: Config, dotted: str) -> Any:  # noqa: ANN401
     if _schema_for(dotted) is None:
         raise ConfigError(f"unknown key {dotted!r}")
     target: Any = config
@@ -243,7 +292,11 @@ def get_dotted(config: Config, dotted: str) -> Any:
     return target
 
 
-def _coerce(raw: str, expected: Any, dotted: str) -> Any:
+def _coerce(  # noqa: ANN401
+    raw: str,
+    expected: Any,  # noqa: ANN401
+    dotted: str,
+) -> Any:  # noqa: ANN401
     if expected is bool:
         lowered = raw.strip().lower()
         if lowered in ("true", "1", "yes", "on"):
@@ -271,7 +324,7 @@ def set_dotted(config: Config, dotted: str, raw: str) -> None:
     _check_values(config)
 
 
-def _toml(value: Any) -> str:
+def _toml(value: Any) -> str:  # noqa: ANN401
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
@@ -293,7 +346,9 @@ def dump_toml(config: Config) -> str:
         lines.append(f"key_path = {_toml(config.vehicle.key_path)}")
     lines += ["", "[powerwall]"]
     if config.powerwall.energy_site_id is not None:
-        lines.append(f"energy_site_id = {_toml(config.powerwall.energy_site_id)}")
+        lines.append(
+            f"energy_site_id = {_toml(config.powerwall.energy_site_id)}"
+        )
     auto = config.auto_charge
     lines += [
         "",
@@ -320,17 +375,19 @@ def dump_toml(config: Config) -> str:
 
 
 def save_config(config: Config, path: Path | None = None) -> None:
-    """Write config.toml atomically with mode 0644."""
+    """Write config.toml atomically with mode 0600."""
     path = path or config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=".config-", suffix=".tmp"
+    )
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(dump_toml(config))
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_path, 0o644)
+        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
@@ -15,7 +16,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from dotenv import dotenv_values
 from tesla_fleet_api import TeslaFleetApi, TeslaFleetOAuth
-from tesla_fleet_api.const import Scope
+from tesla_fleet_api.const import Method, Region, Scope
 from tesla_fleet_api.exceptions import TeslaFleetError
 
 from .config import Config, ConfigError, config_dir, key_path, load_config
@@ -75,7 +76,9 @@ def _first(*values: str | None) -> str | None:
     return None
 
 
-def env_value(name: str, environ: Mapping[str, str] | None = None) -> str | None:
+def env_value(
+    name: str, environ: Mapping[str, str] | None = None
+) -> str | None:
     """Return a value from the environment or the .env files, env first."""
     env = os.environ if environ is None else environ
     if env.get(name):
@@ -106,7 +109,9 @@ def load_credentials(
             "(see .env.example)"
         )
     resolved_secret = _first(
-        client_secret, env.get("TESLA_CLIENT_SECRET"), dotenv.get("TESLA_CLIENT_SECRET")
+        client_secret,
+        env.get("TESLA_CLIENT_SECRET"),
+        dotenv.get("TESLA_CLIENT_SECRET"),
     )
     if resolved_secret is None:
         raise AuthError(
@@ -119,7 +124,11 @@ def load_credentials(
         dotenv.get("TESLA_REDIRECT_URI"),
         DEFAULT_REDIRECT_URI,
     )
-    return Credentials(resolved_id, resolved_secret, resolved_redirect)
+    return Credentials(
+        resolved_id,
+        resolved_secret,
+        resolved_redirect or DEFAULT_REDIRECT_URI,
+    )
 
 
 def _fix_empty_json(oauth: TeslaFleetOAuth) -> None:
@@ -134,7 +143,12 @@ def _fix_empty_json(oauth: TeslaFleetOAuth) -> None:
     """
     base_request = TeslaFleetApi._request
 
-    async def request(method, path, params=None, json=None):
+    async def request(
+        method: Method,
+        path: str,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         await oauth.check_access_token()
         return await base_request(
             oauth, method, path, params, {} if json is None else json
@@ -152,7 +166,7 @@ def build_oauth(
     """Create a TeslaFleetOAuth bound to stored tokens when available."""
     oauth = TeslaFleetOAuth(
         session,
-        region=config.region,
+        region=cast(Region, config.region),
         client_id=credentials.client_id,
         client_secret=credentials.client_secret,
         redirect_uri=credentials.redirect_uri,
@@ -169,7 +183,7 @@ async def oauth_client(
     credentials: Credentials,
     config: Config | None = None,
     stored: Tokens | None = None,
-) -> AsyncIterator[TeslaFleetOAuth]:
+) -> AsyncGenerator[TeslaFleetOAuth]:
     """Yield an OAuth client with a session that closes on exit."""
     config = config or load_config()
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
@@ -177,11 +191,16 @@ async def oauth_client(
         yield build_oauth(session, credentials, config, stored)
 
 
-async def build_vehicle(oauth: TeslaFleetOAuth, config: Config):
+async def build_vehicle(  # noqa: ANN401
+    oauth: TeslaFleetOAuth,
+    config: Config,
+) -> Any:  # noqa: ANN401
     """Create the vehicle bound to the configured command transport."""
     vin = config.vehicle.vin
     if vin is None:
-        raise ConfigError("no VIN set; run 'tesla config set vehicle.vin <vin>'")
+        raise ConfigError(
+            "no VIN set; run 'tesla config set vehicle.vin <vin>'"
+        )
     if config.vehicle.command_mode == "signed":
         await oauth.get_private_key(str(key_path(config)))
         return oauth.vehicles.createSigned(vin)
@@ -205,7 +224,9 @@ async def ensure_fresh_token(
         ) from exc
     if not rotated:
         return None
-    tokens = Tokens(refresh_token=rotated["refresh_token"], expires=rotated["expires"])
+    tokens = Tokens(
+        refresh_token=rotated["refresh_token"], expires=rotated["expires"]
+    )
     save_tokens(tokens, path)
     return tokens
 
@@ -235,7 +256,7 @@ async def exchange_code(
 
 
 def parse_callback(raw: str, expected_state: str | None = "login") -> str:
-    """Extract the authorization code from a pasted callback URL or bare code."""
+    """Extract the authorization code from a pasted URL or bare code."""
     text = raw.strip()
     if not text:
         raise AuthError("no authorization code provided")
@@ -250,7 +271,7 @@ def parse_callback(raw: str, expected_state: str | None = "login") -> str:
     code = query.get("code", [None])[0]
     if not code:
         raise AuthError("callback URL did not contain a code")
-    return code
+    return str(code)
 
 
 async def _public_key(config: Config) -> tuple[Path, str]:
@@ -258,7 +279,11 @@ async def _public_key(config: Config) -> tuple[Path, str]:
     path = key_path(config)
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        client = TeslaFleetOAuth(session, region=config.region, client_id="")
+        client = TeslaFleetOAuth(
+            session,
+            region=cast(Region, config.region),
+            client_id="",
+        )
         await client.get_private_key(str(path))
         return path, client.public_pem
 
@@ -278,7 +303,9 @@ async def load_public_key(config: Config) -> tuple[Path, str]:
     return await _public_key(config)
 
 
-async def _partner_token(oauth: TeslaFleetOAuth, credentials: Credentials) -> None:
+async def _partner_token(
+    oauth: TeslaFleetOAuth, credentials: Credentials
+) -> None:
     """Authenticate as the partner app (client credentials grant).
 
     partner_login() sets the access token but not expires, so set expires to
@@ -293,13 +320,13 @@ async def _partner_token(oauth: TeslaFleetOAuth, credentials: Credentials) -> No
 
 async def register_domain(
     oauth: TeslaFleetOAuth, credentials: Credentials, domain: str
-) -> dict:
+) -> dict[str, Any]:
     """Register the partner domain with Tesla using a partner token."""
     await _partner_token(oauth, credentials)
     return await oauth.partner.register(domain)
 
 
-def extract_public_key(data: dict) -> str | None:
+def extract_public_key(data: dict[str, Any]) -> str | None:
     """Pull the PEM out of a partner_accounts/public_key response."""
     response = data.get("response", data)
     if isinstance(response, str):
@@ -352,7 +379,8 @@ def public_point(pem: str) -> str | None:
     if not isinstance(key, ec.EllipticCurvePublicKey):
         return None
     return key.public_bytes(
-        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint
+        serialization.Encoding.X962,
+        serialization.PublicFormat.UncompressedPoint,
     ).hex()
 
 

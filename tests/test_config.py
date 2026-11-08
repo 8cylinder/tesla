@@ -1,10 +1,14 @@
+import stat
+
 import pytest
 
 from tesla.config import (
     Config,
     ConfigError,
+    config_path,
     dump_toml,
     get_dotted,
+    key_path,
     load_config,
     save_config,
     set_dotted,
@@ -22,6 +26,34 @@ def test_defaults_when_missing(config_dir):
     assert config.region == "na"
     assert config.vehicle.command_mode == "signed"
     assert config.auto_charge.threshold == 100.0
+
+
+def test_config_path_uses_platformdirs(config_dir):
+    assert config_path() == config_dir / "config.toml"
+    assert config_path().is_absolute()
+
+
+def test_save_config_is_0600(config_dir):
+    save_config(Config())
+    mode = stat.S_IMODE(config_path().stat().st_mode)
+    assert mode == 0o600
+
+
+def test_relative_key_path_resolves_against_config(config_dir):
+    write_config(config_dir, '[vehicle]\nkey_path = "keys/private.pem"\n')
+    config = load_config()
+    assert key_path(config) == config_dir / "keys" / "private.pem"
+
+
+def test_absolute_key_path_is_kept(config_dir, tmp_path):
+    target = tmp_path / "elsewhere.pem"
+    write_config(config_dir, f'[vehicle]\nkey_path = "{target}"\n')
+    config = load_config()
+    assert key_path(config) == target
+
+
+def test_default_key_path(config_dir):
+    assert key_path(Config()) == config_dir / "private_key.pem"
 
 
 def test_load_from_file(config_dir):
@@ -44,21 +76,27 @@ def test_load_from_file(config_dir):
     assert config.auto_charge.poll_interval_seconds == 300
 
 
-def test_unknown_key_rejected(config_dir):
+def test_unknown_key_warns_and_is_ignored(config_dir):
     write_config(config_dir, "bogus = 1\n")
-    with pytest.raises(ConfigError, match="unknown key 'bogus'"):
-        load_config()
+    unknown = []
+    config = load_config(on_unknown=unknown.append)
+    assert config.region == "na"
+    assert unknown == ["bogus"]
 
 
-def test_unknown_section_key_rejected(config_dir):
+def test_unknown_section_key_warns_and_is_ignored(config_dir):
     write_config(config_dir, '[vehicle]\ncolor = "red"\n')
-    with pytest.raises(ConfigError, match="unknown key 'vehicle.color'"):
-        load_config()
+    unknown = []
+    config = load_config(on_unknown=unknown.append)
+    assert config.vehicle.command_mode == "signed"
+    assert unknown == ["vehicle.color"]
 
 
 def test_wrong_type_rejected(config_dir):
     write_config(config_dir, '[auto_charge]\nthreshold = "high"\n')
-    with pytest.raises(ConfigError, match="'auto_charge.threshold' must be float"):
+    with pytest.raises(
+        ConfigError, match="'auto_charge.threshold' must be float"
+    ):
         load_config()
 
 

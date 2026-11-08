@@ -13,6 +13,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 from tesla_fleet_api import TeslaFleetOAuth
@@ -36,6 +37,7 @@ from .car import charging_state as read_charging_state
 from .car import vehicle_status as read_vehicle_status
 from .client import build_vehicle, ensure_fresh_token
 from .config import Config, ConfigError
+from .notify import NtfyNotifier
 from .powerwall import percentage_charged
 
 LOGGER = logging.getLogger(__name__)
@@ -94,7 +96,9 @@ def _at_upper_limit(status: VehicleStatus, cos: ChargeOnSolarSettings) -> bool:
     )
 
 
-def _below_lower_limit(status: VehicleStatus, cos: ChargeOnSolarSettings) -> bool:
+def _below_lower_limit(
+    status: VehicleStatus, cos: ChargeOnSolarSettings
+) -> bool:
     return (
         status.battery_level is not None
         and cos.lower_limit is not None
@@ -138,9 +142,13 @@ def decide_charge_on_solar(
     if status.cos_state == "no_charge_recommended":
         if status.cos_reason == "POWERWALL_CHARGE_PRIORITY":
             return Decision(Action.SLEEP, "waiting_powerwall")
-        return _below_floor(powerwall_pct, stop, "charging_stopped", "charging_paused")
+        return _below_floor(
+            powerwall_pct, stop, "charging_stopped", "charging_paused"
+        )
     if status.cos_state == "waiting_for_server":
-        return _below_floor(powerwall_pct, stop, "charging_stopped", "charging_paused")
+        return _below_floor(
+            powerwall_pct, stop, "charging_stopped", "charging_paused"
+        )
     if status.cos_state == "charging_on_excess_solar":
         return Decision(Action.SLEEP)
     if status.cos_state == "user_stopped":
@@ -165,7 +173,7 @@ def backoff_delay(
 ) -> float:
     """Exponential backoff with +/-20% jitter, capped at 300 s."""
     base = min(BACKOFF_INITIAL * (2 ** (failures - 1)), BACKOFF_CAP)
-    return base * jitter(0.8, 1.2)
+    return float(base * jitter(0.8, 1.2))
 
 
 class AlreadyRunning(Exception):
@@ -214,8 +222,8 @@ class TeslaAutoChargeClient:
     def __init__(self, oauth: TeslaFleetOAuth, config: Config) -> None:
         self._oauth = oauth
         self._config = config
-        self._vehicle = None
-        self._site = None
+        self._vehicle: Any = None
+        self._site: Any = None
 
     async def build(self) -> None:
         await ensure_fresh_token(self._oauth)
@@ -264,7 +272,9 @@ class TeslaAutoChargeClient:
     async def start_charging(self) -> None:
         await self._vehicle.charge_start()
 
-    async def verify_charging(self, attempts: int = 6, delay: float = 10.0) -> bool:
+    async def verify_charging(
+        self, attempts: int = 6, delay: float = 10.0
+    ) -> bool:
         state = None
         for attempt in range(attempts):
             try:
@@ -297,7 +307,7 @@ class AutoCharger:
 
     def __init__(
         self,
-        client,
+        client: TeslaAutoChargeClient,
         config: Config,
         *,
         dry_run: bool = False,
@@ -305,7 +315,7 @@ class AutoCharger:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         jitter: Callable[[float, float], float] = random.uniform,
-        notifier=None,
+        notifier: NtfyNotifier | None = None,
     ) -> None:
         self.client = client
         self.auto = config.auto_charge
@@ -354,7 +364,11 @@ class AutoCharger:
             return False
         if not self.once:
             return True
-        last = self.notifier.last_run() if hasattr(self.notifier, "last_run") else None
+        last = (
+            self.notifier.last_run()
+            if hasattr(self.notifier, "last_run")
+            else None
+        )
         if last is None:
             return True
         return (time.time() - last) >= 2 * self.auto.poll_interval_seconds
@@ -365,7 +379,12 @@ class AutoCharger:
         if hasattr(self.notifier, "touch"):
             self.notifier.touch()
 
-    async def _startup_report(self, pct, action, state) -> None:
+    async def _startup_report(
+        self,
+        pct: float | None,
+        action: Action,
+        state: str | None,
+    ) -> None:
         if action is Action.SLEEP:
             if pct is None:
                 message = "watcher started; Powerwall reading unavailable"
@@ -389,7 +408,9 @@ class AutoCharger:
         elif pct is None:
             message = "watcher started; starting charge"
         else:
-            message = f"watcher started; Powerwall at {pct:.1f}%; starting charge"
+            message = (
+                f"watcher started; Powerwall at {pct:.1f}%; starting charge"
+            )
         await self._notify(
             "on_start", message, priority=2, tags=("information_source",)
         )
@@ -441,18 +462,22 @@ class AutoCharger:
                     return code
                 continue
 
-            action = decide(pct, self.auto.threshold, None, self.auto.require_plugged)
+            action = decide(
+                pct, self.auto.threshold, None, self.auto.require_plugged
+            )
             state = None
             if pct is not None and pct >= self.auto.threshold:
                 try:
                     state = await self.client.charging_state()
                 except AUTH_ERRORS as exc:
                     LOGGER.error(
-                        "authentication failed: %s; re-run 'tesla auth login'", exc
+                        "authentication failed: %s; re-run 'tesla auth login'",
+                        exc,
                     )
                     await self._notify(
                         "auth_failed",
-                        f"authentication failed: {exc}; re-run 'tesla auth login'",
+                        f"authentication failed: {exc}; "
+                        "re-run 'tesla auth login'",
                         priority=5,
                         tags=("rotating_light",),
                     )
@@ -474,7 +499,9 @@ class AutoCharger:
                 self._report_due = False
             if action is Action.SLEEP:
                 LOGGER.info(
-                    "Powerwall %s is below threshold %s", pct, self.auto.threshold
+                    "Powerwall %s is below threshold %s",
+                    pct,
+                    self.auto.threshold,
                 )
                 self._note_situation("below_threshold")
             elif action is Action.WAIT:
@@ -494,7 +521,8 @@ class AutoCharger:
                     )
                 else:
                     LOGGER.info(
-                        "Powerwall %s is at threshold but charge state is unknown",
+                        "Powerwall %s is at threshold but charge state is "
+                        "unknown",
                         pct,
                     )
                     await self._notify(
@@ -505,10 +533,13 @@ class AutoCharger:
                         on_change="wait_plug",
                     )
             elif action is Action.WAIT_PLUG:
-                LOGGER.info("Powerwall %s is at threshold; waiting for plug", pct)
+                LOGGER.info(
+                    "Powerwall %s is at threshold; waiting for plug", pct
+                )
                 await self._notify(
                     "wait_plug",
-                    "Powerwall at threshold; waiting for the car to be plugged in",
+                    "Powerwall at threshold; waiting for the car to be "
+                    "plugged in",
                     priority=3,
                     tags=("electric_plug",),
                     on_change="wait_plug",
@@ -550,7 +581,8 @@ class AutoCharger:
                     )
                     await self._notify(
                         "gave_up",
-                        f"giving up after {self.failures} consecutive trigger failures",
+                        f"giving up after {self.failures} consecutive "
+                        "trigger failures",
                         priority=5,
                         tags=("rotating_light",),
                     )
@@ -563,7 +595,9 @@ class AutoCharger:
             await self.sleep(self.auto.poll_interval_seconds)
 
     async def _auth_failure(self, exc: BaseException) -> int:
-        LOGGER.error("authentication failed: %s; re-run 'tesla auth login'", exc)
+        LOGGER.error(
+            "authentication failed: %s; re-run 'tesla auth login'", exc
+        )
         await self._notify(
             "auth_failed",
             f"authentication failed: {exc}; re-run 'tesla auth login'",
@@ -768,7 +802,9 @@ class AutoCharger:
                 await self.client.set_charge_limit(self.auto.set_charge_limit)
             await self.client.start_charging()
         except AUTH_ERRORS as exc:
-            LOGGER.error("authentication failed: %s; re-run 'tesla auth login'", exc)
+            LOGGER.error(
+                "authentication failed: %s; re-run 'tesla auth login'", exc
+            )
             await self._notify(
                 "auth_failed",
                 f"authentication failed: {exc}; re-run 'tesla auth login'",
@@ -800,15 +836,19 @@ class AutoCharger:
         return TriggerResult.STARTED
 
     async def _stop_gate(self, reason: str | None) -> TriggerResult:
-        """Latch charging off; CoS stays enabled and is re-armed at threshold."""
+        """Latch charging off; CoS stays enabled and re-arms at threshold."""
         if self.dry_run:
-            LOGGER.info("[dry-run] would wake the car and charge_stop (%s)", reason)
+            LOGGER.info(
+                "[dry-run] would wake the car and charge_stop (%s)", reason
+            )
             return TriggerResult.STARTED
         try:
             await self.client.wake()
             await self.client.stop_charging()
         except AUTH_ERRORS as exc:
-            LOGGER.error("authentication failed: %s; re-run 'tesla auth login'", exc)
+            LOGGER.error(
+                "authentication failed: %s; re-run 'tesla auth login'", exc
+            )
             await self._notify(
                 "auth_failed",
                 f"authentication failed: {exc}; re-run 'tesla auth login'",
@@ -869,7 +909,9 @@ class AutoCharger:
         self.failures += 1
         if self.failures >= MAX_FAILURES:
             LOGGER.error(
-                "giving up after %s consecutive failures: %s", self.failures, exc
+                "giving up after %s consecutive failures: %s",
+                self.failures,
+                exc,
             )
             await self._notify(
                 "gave_up",
@@ -903,14 +945,18 @@ class AutoCharger:
         else:
             limit = "no limit change"
         if self.dry_run:
-            LOGGER.info("[dry-run] would wake the car (%s) and charge_start", limit)
+            LOGGER.info(
+                "[dry-run] would wake the car (%s) and charge_start", limit
+            )
             return TriggerResult.STARTED
         try:
             await self.client.wake()
             if self.auto.require_plugged:
                 state = await self.client.charging_state()
                 if state == "Disconnected":
-                    LOGGER.info("vehicle is awake but not plugged in; waiting for plug")
+                    LOGGER.info(
+                        "vehicle is awake but not plugged in; waiting for plug"
+                    )
                     await self._notify(
                         "wait_plug",
                         "vehicle is awake but not plugged in; waiting for plug",
@@ -923,7 +969,9 @@ class AutoCharger:
                 await self.client.set_charge_limit(self.auto.set_charge_limit)
             await self.client.start_charging()
         except AUTH_ERRORS as exc:
-            LOGGER.error("authentication failed: %s; re-run 'tesla auth login'", exc)
+            LOGGER.error(
+                "authentication failed: %s; re-run 'tesla auth login'", exc
+            )
             await self._notify(
                 "auth_failed",
                 f"authentication failed: {exc}; re-run 'tesla auth login'",
@@ -975,7 +1023,7 @@ class AutoCharger:
 
 
 async def watch(
-    client,
+    client: TeslaAutoChargeClient,
     config: Config,
     *,
     dry_run: bool = False,
@@ -983,7 +1031,7 @@ async def watch(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], float] = time.monotonic,
     jitter: Callable[[float, float], float] = random.uniform,
-    notifier=None,
+    notifier: NtfyNotifier | None = None,
 ) -> int:
     """Poll and trigger once; returns the process exit code (0/2/3)."""
     charger = AutoCharger(
@@ -1000,12 +1048,12 @@ async def watch(
 
 
 async def run(
-    client,
+    client: TeslaAutoChargeClient,
     config: Config,
     *,
     dry_run: bool = False,
     once: bool = False,
-    notifier=None,
+    notifier: NtfyNotifier | None = None,
 ) -> int:
     """Run the watch loop with SIGINT/SIGTERM handling; returns exit code."""
     loop = asyncio.get_running_loop()

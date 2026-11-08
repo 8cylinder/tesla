@@ -51,7 +51,11 @@ def test_credentials_from_dotenv(monkeypatch, tmp_path, config_dir):
         "TESLA_REDIRECT_URI=http://localhost:9999/cb\n"
     )
     monkeypatch.chdir(tmp_path)
-    for name in ("TESLA_CLIENT_ID", "TESLA_CLIENT_SECRET", "TESLA_REDIRECT_URI"):
+    for name in (
+        "TESLA_CLIENT_ID",
+        "TESLA_CLIENT_SECRET",
+        "TESLA_REDIRECT_URI",
+    ):
         monkeypatch.delenv(name, raising=False)
     assert load_credentials() == Credentials(
         "dotenv-id", "dotenv-secret", "http://localhost:9999/cb"
@@ -60,7 +64,11 @@ def test_credentials_from_dotenv(monkeypatch, tmp_path, config_dir):
 
 def test_credentials_missing_raises(monkeypatch, tmp_path, config_dir):
     monkeypatch.chdir(tmp_path)
-    for name in ("TESLA_CLIENT_ID", "TESLA_CLIENT_SECRET", "TESLA_REDIRECT_URI"):
+    for name in (
+        "TESLA_CLIENT_ID",
+        "TESLA_CLIENT_SECRET",
+        "TESLA_REDIRECT_URI",
+    ):
         monkeypatch.delenv(name, raising=False)
     with pytest.raises(AuthError, match="TESLA_CLIENT_ID"):
         load_credentials()
@@ -201,7 +209,9 @@ class FakePartnerOAuth:
 
 async def test_register_domain_sets_expires(config_dir):
     oauth = FakePartnerOAuth()
-    result = await register_domain(oauth, Credentials("id", "secret"), "example.com")
+    result = await register_domain(
+        oauth, Credentials("id", "secret"), "example.com"
+    )
     assert oauth.logged_in[0:2] == ("id", "secret")
     assert oauth.logged_in[2] is not None
     assert oauth.partner.domain == "example.com"
@@ -211,9 +221,13 @@ async def test_register_domain_sets_expires(config_dir):
 
 async def test_registered_public_key(config_dir):
     pem = "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----"
-    oauth = FakePartnerOAuth(public_key_result={"response": {"public_key": pem}})
+    oauth = FakePartnerOAuth(
+        public_key_result={"response": {"public_key": pem}}
+    )
     assert (
-        await registered_public_key(oauth, Credentials("id", "secret"), "example.com")
+        await registered_public_key(
+            oauth, Credentials("id", "secret"), "example.com"
+        )
         == pem
     )
 
