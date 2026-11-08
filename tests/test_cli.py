@@ -22,6 +22,13 @@ def combined(result):
     return result.output + (result.stderr or "")
 
 
+CREDENTIAL_ENV = {
+    "TESLA_CLIENT_ID": "id",
+    "TESLA_CLIENT_SECRET": "secret",
+    "TESLA_REDIRECT_URI": "http://localhost:8085/callback",
+}
+
+
 def test_version(config_dir):
     result = invoke(config_dir, "--version")
     assert result.exit_code == 0
@@ -177,7 +184,7 @@ def test_powerwall_status_without_tokens_exits_2(config_dir):
         config_dir, "config", "set", "powerwall.energy_site_id", "123"
     )
     assert result.exit_code == 0
-    result = invoke(config_dir, "powerwall", "status")
+    result = invoke(config_dir, "powerwall", "status", env=CREDENTIAL_ENV)
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
 
@@ -235,7 +242,7 @@ def test_powerwall_notify_without_tokens_exits_2(config_dir):
         config_dir,
         "powerwall",
         "notify",
-        env={"TESLA_NTFY_TOPIC": "test-topic"},
+        env={**CREDENTIAL_ENV, "TESLA_NTFY_TOPIC": "test-topic"},
     )
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
@@ -465,7 +472,7 @@ def test_car_status_without_vin_exits_2(config_dir):
 def test_car_status_without_tokens_exits_2(config_dir):
     result = invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST")
     assert result.exit_code == 0
-    result = invoke(config_dir, "car", "status")
+    result = invoke(config_dir, "car", "status", env=CREDENTIAL_ENV)
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
 
@@ -604,7 +611,7 @@ def test_auto_charge_without_tokens_exits_2(config_dir):
         ).exit_code
         == 0
     )
-    result = invoke(config_dir, "auto-charge", "--once")
+    result = invoke(config_dir, "auto-charge", "--once", env=CREDENTIAL_ENV)
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
 
@@ -619,7 +626,7 @@ def test_car_charge_start_without_tokens_exits_2(config_dir):
         invoke(config_dir, "config", "set", "vehicle.vin", "5YJTEST").exit_code
         == 0
     )
-    result = invoke(config_dir, "car", "charge", "start")
+    result = invoke(config_dir, "car", "charge", "start", env=CREDENTIAL_ENV)
     assert result.exit_code == 2
     assert "tesla auth login" in combined(result)
 

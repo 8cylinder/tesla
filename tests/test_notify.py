@@ -100,7 +100,10 @@ def test_build_notifier_ntfy_uses_config_url(config_dir):
     assert notifier.url == "https://config.example"
 
 
-def test_build_notifier_pushover_missing_keys(config_dir):
+def test_build_notifier_pushover_missing_keys(
+    config_dir, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
     config = make_config(enabled=True, service="pushover")
     with pytest.raises(NotifyError, match="TESLA_PUSHOVER_TOKEN"):
         build_notifier(config, environ={"TESLA_PUSHOVER_USER": "user"})

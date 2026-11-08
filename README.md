@@ -9,10 +9,12 @@ reaches a threshold. It can also read status, send manual charging
 commands, and check key/registration health.
 
 [![CI](https://github.com/8cylinder/tesla/actions/workflows/ci.yml/badge.svg)](https://github.com/8cylinder/tesla/actions/workflows/ci.yml)
+[![Docs](https://img.shields.io/badge/docs-8cylinder.github.io%2Ftesla-blue.svg)](https://8cylinder.github.io/tesla/)
 [![License: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](https://github.com/8cylinder/tesla/blob/main/LICENSE)
 
 Repository: <https://github.com/8cylinder/tesla> ·
-Issues: <https://github.com/8cylinder/tesla/issues>
+Issues: <https://github.com/8cylinder/tesla/issues> ·
+Docs: <https://8cylinder.github.io/tesla/>
 
 ## Requirements
 
