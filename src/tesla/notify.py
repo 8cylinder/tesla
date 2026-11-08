@@ -1,4 +1,4 @@
-"""Best-effort notifications via ntfy (https://ntfy.sh)."""
+"""Best-effort notifications via ntfy (https://ntfy.sh) or Pushover."""
 
 from __future__ import annotations
 
@@ -115,22 +115,18 @@ class NotifyState:
             LOGGER.warning("cannot save notify state to %s: %s", self.path, exc)
 
 
-class NtfyNotifier:
-    """Publish messages to an ntfy topic; failures never propagate."""
+class Notifier:
+    """Shared gating, cooldown and state handling for a notification service."""
+
+    name = "notify"
 
     def __init__(
         self,
         config: NotifyConfig,
-        topic: str,
         *,
-        url: str | None = None,
-        token: str | None = None,
         state: NotifyState | None = None,
     ) -> None:
         self.config = config
-        self.topic = topic
-        self.url = (url or config.url).rstrip("/")
-        self.token = token
         self.state = state or NotifyState()
 
     async def send(
@@ -160,34 +156,30 @@ class NtfyNotifier:
                 return False
             if cooldown and not self.state.allow(stage, cooldown):
                 return False
-        payload: dict[str, object] = {
-            "topic": self.topic,
-            "message": message,
-            "title": title or DEFAULT_TITLE,
-            "priority": effective_priority,
-        }
-        all_tags = self._tags(tags)
-        if all_tags:
-            payload["tags"] = all_tags
-        headers = {"Content-Type": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        timeout = aiohttp.ClientTimeout(total=SEND_TIMEOUT_SECONDS)
-        try:
-            async with (
-                aiohttp.ClientSession(timeout=timeout) as session,
-                session.post(self.url, json=payload, headers=headers) as resp,
-            ):
-                if not 200 <= resp.status < 300:
-                    LOGGER.warning("ntfy publish failed: HTTP %s", resp.status)
-                    return False
-        except (TimeoutError, aiohttp.ClientError) as exc:
-            LOGGER.warning("ntfy publish failed: %s", exc)
+        delivered = await self._deliver(
+            stage=stage,
+            message=message,
+            title=title or DEFAULT_TITLE,
+            priority=effective_priority,
+            tags=self._tags(tags),
+        )
+        if not delivered:
             return False
         if on_change is not None:
             self.state.set_situation(on_change)
         self.state.mark(stage)
         return True
+
+    async def _deliver(
+        self,
+        *,
+        stage: str,
+        message: str,
+        title: str,
+        priority: int,
+        tags: list[str],
+    ) -> bool:
+        raise NotImplementedError
 
     def note_situation(self, value: str) -> None:
         """Record the current situation without sending anything."""
@@ -211,19 +203,164 @@ class NtfyNotifier:
         return tags
 
 
+class NtfyNotifier(Notifier):
+    """Publish messages to an ntfy topic; failures never propagate."""
+
+    name = "ntfy"
+
+    def __init__(
+        self,
+        config: NotifyConfig,
+        topic: str,
+        *,
+        url: str | None = None,
+        token: str | None = None,
+        state: NotifyState | None = None,
+    ) -> None:
+        super().__init__(config, state=state)
+        self.topic = topic
+        self.url = (url or config.ntfy.url).rstrip("/")
+        self.token = token
+
+    async def _deliver(
+        self,
+        *,
+        stage: str,
+        message: str,
+        title: str,
+        priority: int,
+        tags: list[str],
+    ) -> bool:
+        payload: dict[str, object] = {
+            "topic": self.topic,
+            "message": message,
+            "title": title,
+            "priority": priority,
+        }
+        if tags:
+            payload["tags"] = tags
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        timeout = aiohttp.ClientTimeout(total=SEND_TIMEOUT_SECONDS)
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.post(self.url, json=payload, headers=headers) as resp,
+            ):
+                if not 200 <= resp.status < 300:
+                    LOGGER.warning("ntfy publish failed: HTTP %s", resp.status)
+                    return False
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            LOGGER.warning("ntfy publish failed: %s", exc)
+            return False
+        return True
+
+
+# Map the shared 1-5 stage priority onto Pushover's -2..2 scale. Emergency
+# priority (2) is deliberately not used: it repeats until acknowledged.
+_PUSHOVER_PRIORITIES = {1: -2, 2: -1, 3: 0, 4: 1, 5: 1}
+
+
+def pushover_priority(priority: int) -> int:
+    """Translate a generic notification priority (1-5) to Pushover's scale."""
+    return _PUSHOVER_PRIORITIES.get(priority, 0)
+
+
+class PushoverNotifier(Notifier):
+    """Publish messages through the Pushover message API."""
+
+    name = "pushover"
+
+    def __init__(
+        self,
+        config: NotifyConfig,
+        user: str,
+        token: str,
+        *,
+        url: str | None = None,
+        device: str | None = None,
+        sound: str | None = None,
+        state: NotifyState | None = None,
+    ) -> None:
+        super().__init__(config, state=state)
+        self.user = user
+        self.token = token
+        self.url = (url or config.pushover.url).rstrip("/")
+        self.device = device if device is not None else config.pushover.device
+        self.sound = sound if sound is not None else config.pushover.sound
+
+    async def _deliver(
+        self,
+        *,
+        stage: str,
+        message: str,
+        title: str,
+        priority: int,
+        tags: list[str],
+    ) -> bool:
+        data = {
+            "token": self.token,
+            "user": self.user,
+            "message": message,
+            "title": title,
+            "priority": str(pushover_priority(priority)),
+        }
+        if self.device:
+            data["device"] = self.device
+        if self.sound:
+            data["sound"] = self.sound
+        timeout = aiohttp.ClientTimeout(total=SEND_TIMEOUT_SECONDS)
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.post(self.url, data=data) as resp,
+            ):
+                if not 200 <= resp.status < 300:
+                    LOGGER.warning(
+                        "pushover publish failed: HTTP %s", resp.status
+                    )
+                    return False
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            LOGGER.warning("pushover publish failed: %s", exc)
+            return False
+        return True
+
+
 def build_notifier(
     config: Config,
     *,
     environ: Mapping[str, str] | None = None,
-) -> NtfyNotifier | None:
-    """Build a notifier when enabled; topic/token come from env or .env."""
+) -> Notifier | None:
+    """Build the configured notifier; credentials come from env or .env."""
     if not config.notify.enabled:
         return None
+    if config.notify.service == "pushover":
+        token = env_value("TESLA_PUSHOVER_TOKEN", environ)
+        user = env_value("TESLA_PUSHOVER_USER", environ)
+        if not token or not user:
+            missing = [
+                name
+                for name, value in (
+                    ("TESLA_PUSHOVER_TOKEN", token),
+                    ("TESLA_PUSHOVER_USER", user),
+                )
+                if not value
+            ]
+            raise NotifyError(
+                f"{' and '.join(missing)} not set; add to .env or the "
+                "environment"
+            )
+        url = (
+            env_value("TESLA_PUSHOVER_URL", environ)
+            or config.notify.pushover.url
+        )
+        return PushoverNotifier(config.notify, user, token, url=url)
     topic = env_value("TESLA_NTFY_TOPIC", environ)
     if not topic:
         raise NotifyError(
             "TESLA_NTFY_TOPIC is not set; add it to .env or the environment"
         )
-    url = env_value("TESLA_NTFY_URL", environ) or config.notify.url
+    url = env_value("TESLA_NTFY_URL", environ) or config.notify.ntfy.url
     token = env_value("TESLA_NTFY_TOKEN", environ)
     return NtfyNotifier(config.notify, topic, url=url, token=token)

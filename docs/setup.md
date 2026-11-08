@@ -143,14 +143,23 @@ stop_margin = 5.0              # latch charging off below threshold - margin
 
 [notify]
 enabled = false
-url = "https://ntfy.sh"        # or a self-hosted server
+service = "ntfy"               # or "pushover"
 priority = 3                   # default notification priority (1-5)
-tags = "tesla"                 # comma-separated, emoji shortcodes allowed
+tags = "tesla"                 # comma-separated, ntfy only
 min_priority = 1               # drop stages with a lower priority
 verbose = false                # true = ignore cooldowns (observation mode)
 on_start = true                # report the current state on start/restart
-# The topic and token are credentials and live in the environment:
-#   TESLA_NTFY_TOPIC, TESLA_NTFY_TOKEN (optional), TESLA_NTFY_URL (optional)
+
+[notify.ntfy]
+url = "https://ntfy.sh"        # or a self-hosted server
+
+[notify.pushover]
+url = "https://api.pushover.net/1/messages.json"
+device = ""                    # optional device name; empty = all devices
+sound = ""                     # optional sound name; empty = user's default
+# Credentials are never stored here; use .env:
+#   ntfy:     TESLA_NTFY_TOPIC, TESLA_NTFY_TOKEN, TESLA_NTFY_URL
+#   pushover: TESLA_PUSHOVER_TOKEN, TESLA_PUSHOVER_USER, TESLA_PUSHOVER_URL
 
 [server]
 url = "beelink.local"          # ssh destination for `tesla server`

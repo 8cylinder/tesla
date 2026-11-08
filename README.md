@@ -129,12 +129,20 @@ stop_margin = 5.0              # latch charging off below threshold - margin
 
 [notify]
 enabled = false
-url = "https://ntfy.sh"
+service = "ntfy"               # or "pushover"
 priority = 3
-tags = "tesla"
+tags = "tesla"                 # ntfy only
 min_priority = 1
 verbose = false
 on_start = true
+
+[notify.ntfy]
+url = "https://ntfy.sh"
+
+[notify.pushover]
+url = "https://api.pushover.net/1/messages.json"
+device = ""
+sound = ""
 
 [server]
 url = "beelink.local"          # ssh destination for `tesla server`
@@ -193,8 +201,8 @@ install the man page; use `make install` from a source checkout.
 
 The published documentation is at
 <https://8cylinder.github.io/tesla/>. It includes the setup guide,
-deployment notes, auto-charge semantics, ntfy details, and the generated
-CLI reference.
+deployment notes, auto-charge semantics, notification details, and the
+generated CLI reference.
 
 Build the HTML site locally with:
 

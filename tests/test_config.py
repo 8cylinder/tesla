@@ -92,6 +92,14 @@ def test_unknown_section_key_warns_and_is_ignored(config_dir):
     assert unknown == ["vehicle.color"]
 
 
+def test_unknown_nested_notify_key_warns_and_is_ignored(config_dir):
+    write_config(config_dir, "[notify.pushover]\ncolor = 1\n")
+    unknown = []
+    config = load_config(on_unknown=unknown.append)
+    assert config.notify.pushover.device == ""
+    assert unknown == ["notify.pushover.color"]
+
+
 def test_wrong_type_rejected(config_dir):
     write_config(config_dir, '[auto_charge]\nthreshold = "high"\n')
     with pytest.raises(
@@ -162,28 +170,52 @@ def test_set_dotted_validation():
 
 def test_get_dotted():
     assert get_dotted(Config(), "auto_charge.poll_interval_seconds") == 300
+    assert get_dotted(Config(), "notify.ntfy.url") == "https://ntfy.sh"
+    assert get_dotted(Config(), "notify.pushover.device") == ""
 
 
 def test_notify_defaults_and_set():
     config = Config()
     assert config.notify.enabled is False
-    assert config.notify.url == "https://ntfy.sh"
+    assert config.notify.service == "ntfy"
+    assert config.notify.ntfy.url == "https://ntfy.sh"
+    assert config.notify.pushover.url == (
+        "https://api.pushover.net/1/messages.json"
+    )
+    assert config.notify.pushover.device == ""
+    assert config.notify.pushover.sound == ""
     assert config.notify.priority == 3
     assert config.notify.min_priority == 1
     assert config.notify.verbose is False
     assert config.notify.on_start is True
     set_dotted(config, "notify.enabled", "true")
+    set_dotted(config, "notify.service", "pushover")
     set_dotted(config, "notify.priority", "5")
     set_dotted(config, "notify.tags", "tesla,powerwall")
     set_dotted(config, "notify.min_priority", "4")
     set_dotted(config, "notify.verbose", "true")
     set_dotted(config, "notify.on_start", "false")
+    set_dotted(config, "notify.ntfy.url", "https://ntfy.example")
+    set_dotted(
+        config,
+        "notify.pushover.url",
+        "https://pushover.example/messages.json",
+    )
+    set_dotted(config, "notify.pushover.device", "iphone")
+    set_dotted(config, "notify.pushover.sound", "siren")
     assert config.notify.enabled is True
+    assert config.notify.service == "pushover"
     assert config.notify.priority == 5
     assert config.notify.tags == "tesla,powerwall"
     assert config.notify.min_priority == 4
     assert config.notify.verbose is True
     assert config.notify.on_start is False
+    assert config.notify.ntfy.url == "https://ntfy.example"
+    assert config.notify.pushover.url == (
+        "https://pushover.example/messages.json"
+    )
+    assert config.notify.pushover.device == "iphone"
+    assert config.notify.pushover.sound == "siren"
 
 
 def test_notify_priority_validation():
@@ -191,15 +223,50 @@ def test_notify_priority_validation():
         set_dotted(Config(), "notify.priority", "9")
     with pytest.raises(ConfigError, match="notify.min_priority"):
         set_dotted(Config(), "notify.min_priority", "0")
+    with pytest.raises(ConfigError, match="notify.service"):
+        set_dotted(Config(), "notify.service", "email")
+    with pytest.raises(ConfigError, match="notify.ntfy.url"):
+        set_dotted(Config(), "notify.ntfy.url", "")
+    with pytest.raises(ConfigError, match="notify.pushover.url"):
+        set_dotted(Config(), "notify.pushover.url", "")
 
 
 def test_notify_round_trip(config_dir):
     config = Config()
     config.notify.enabled = True
-    config.notify.url = "https://ntfy.example"
+    config.notify.service = "pushover"
+    config.notify.ntfy.url = "https://ntfy.example"
+    config.notify.pushover.url = "https://pushover.example/messages.json"
+    config.notify.pushover.device = "iphone"
+    config.notify.pushover.sound = "siren"
     config.notify.tags = "tesla,powerwall"
     save_config(config)
     assert load_config().notify == config.notify
+
+
+def test_notify_legacy_url_is_migrated(config_dir):
+    write_config(config_dir, '[notify]\nurl = "https://legacy.example"\n')
+    assert load_config().notify.ntfy.url == "https://legacy.example"
+
+
+def test_notify_nested_url_wins_over_legacy(config_dir):
+    write_config(
+        config_dir,
+        '[notify]\nurl = "https://legacy.example"\n'
+        "[notify.ntfy]\n"
+        'url = "https://nested.example"\n',
+    )
+    assert load_config().notify.ntfy.url == "https://nested.example"
+
+
+def test_notify_dump_omits_credentials():
+    config = Config()
+    config.notify.enabled = True
+    config.notify.service = "pushover"
+    text = dump_toml(config)
+    assert "token" not in text.lower()
+    assert "user" not in text.lower()
+    assert "TESLA_PUSHOVER" not in text
 
 
 def test_auto_charge_cos_defaults_and_set():

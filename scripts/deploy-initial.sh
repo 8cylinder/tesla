@@ -17,7 +17,7 @@
 #   --force            replace existing server config/tokens
 #   --yes, -y          do not prompt (required with --force when non-interactive)
 #   --dry-run          show what would happen; make no changes
-#   --no-test-notify   skip the remote ntfy test
+#   --no-test-notify   skip the remote notification test
 #   --skip-preflight   skip deploy-check.sh
 #   --server HOST      destination ssh host
 #   -h, --help
@@ -61,7 +61,7 @@ Flags:
   --force            replace existing server config/tokens
   --yes, -y          do not prompt (required with --force when non-interactive)
   --dry-run          show what would happen; make no changes
-  --no-test-notify   skip the remote ntfy test
+  --no-test-notify   skip the remote notification test
   --skip-preflight   skip deploy-check.sh
   --server HOST      destination ssh host
   -h, --help         show this help
@@ -241,13 +241,24 @@ def emit(key, value):
 
 powerwall = table("powerwall")
 notify = table("notify")
+ntfy = notify.get("ntfy") if isinstance(notify.get("ntfy"), dict) else {}
+pushover = (
+    notify.get("pushover")
+    if isinstance(notify.get("pushover"), dict)
+    else {}
+)
 vehicle = table("vehicle")
 
 emit("region", cfg.get("region", "na"))
 emit("domain", cfg.get("domain"))
 emit("site_id", powerwall.get("energy_site_id"))
 emit("notify_enabled", "true" if notify.get("enabled") is True else "false")
-emit("notify_url", notify.get("url", "https://ntfy.sh"))
+emit("notify_service", notify.get("service", "ntfy"))
+emit("ntfy_url", ntfy.get("url") or notify.get("url", "https://ntfy.sh"))
+emit(
+    "pushover_url",
+    pushover.get("url", "https://api.pushover.net/1/messages.json"),
+)
 emit("priority", notify.get("priority", 3))
 emit("min_priority", notify.get("min_priority", 1))
 emit("key_path", vehicle.get("key_path"))
@@ -296,8 +307,24 @@ case "$MIN_PRIORITY" in
   *) die "notify.min_priority must be 1-5 (got '$MIN_PRIORITY')" ;;
 esac
 
-NOTIFY_URL="$(cfg_get notify_url)"
-[ -n "$NOTIFY_URL" ] || die "notify.url must not be empty"
+NOTIFY_SERVICE="$(cfg_get notify_service)"
+[ -n "$NOTIFY_SERVICE" ] || NOTIFY_SERVICE="ntfy"
+case "$NOTIFY_SERVICE" in
+  ntfy|pushover) ;;
+  *) die "notify.service must be ntfy or pushover (got '$NOTIFY_SERVICE')" ;;
+esac
+
+if [ "$NOTIFY_SERVICE" = "pushover" ]; then
+  NOTIFY_URL="$(cfg_get pushover_url)"
+  NOTIFY_URL="${TESLA_PUSHOVER_URL:-$NOTIFY_URL}"
+  [ -n "$NOTIFY_URL" ] || NOTIFY_URL="https://api.pushover.net/1/messages.json"
+  REQUIRED_NOTIFY_KEYS="TESLA_PUSHOVER_TOKEN TESLA_PUSHOVER_USER"
+else
+  NOTIFY_URL="$(cfg_get ntfy_url)"
+  NOTIFY_URL="${TESLA_NTFY_URL:-$NOTIFY_URL}"
+  [ -n "$NOTIFY_URL" ] || NOTIFY_URL="https://ntfy.sh"
+  REQUIRED_NOTIFY_KEYS="TESLA_NTFY_TOPIC"
+fi
 
 KEY_PATH="$(cfg_get key_path)"
 if [ -n "$KEY_PATH" ]; then
@@ -312,7 +339,7 @@ fi
 
 info "region: $REGION"
 info "energy site: $SITE_ID"
-info "notify: enabled (priority $PRIORITY, min $MIN_PRIORITY)"
+info "notify: enabled via $NOTIFY_SERVICE (priority $PRIORITY, min $MIN_PRIORITY)"
 
 procs="$(ps ax -o pid=,command= 2>/dev/null | grep -E '[t]esla.*(powerwall notify|auto-charge)' || true)"
 if [ -n "$procs" ]; then
@@ -330,7 +357,7 @@ done
 [ -n "$ENV_FILE" ] || die "no app .env found (looked in $REPO/.env and $CONFIG_DIR/.env)"
 info "app env: $ENV_FILE"
 
-for key in TESLA_CLIENT_ID TESLA_CLIENT_SECRET TESLA_REDIRECT_URI TESLA_NTFY_TOPIC; do
+for key in TESLA_CLIENT_ID TESLA_CLIENT_SECRET TESLA_REDIRECT_URI $REQUIRED_NOTIFY_KEYS; do
   value="$(env_get "$key" || true)"
   [ -n "$value" ] || die "$key is missing or empty in $ENV_FILE"
 done
@@ -346,24 +373,32 @@ case "$(env_get TESLA_CLIENT_SECRET || true)" in
     ;;
 esac
 
-topic="$(env_get TESLA_NTFY_TOPIC || true)"
-case "$topic" in
-  *'<unguessable>'*)
-    die "TESLA_NTFY_TOPIC still has the example placeholder"
-    ;;
-esac
-if [ "${#topic}" -lt 12 ]; then
-  warn "TESLA_NTFY_TOPIC is short; it acts as a password on public ntfy.sh"
-fi
+if [ "$NOTIFY_SERVICE" = "pushover" ]; then
+  info "pushover token: set"
+  info "pushover user: set"
+  if [ -n "$(env_get TESLA_PUSHOVER_URL || true)" ]; then
+    info "pushover url: $(env_get TESLA_PUSHOVER_URL || true)"
+  fi
+else
+  topic="$(env_get TESLA_NTFY_TOPIC || true)"
+  case "$topic" in
+    *'<unguessable>'*)
+      die "TESLA_NTFY_TOPIC still has the example placeholder"
+      ;;
+  esac
+  if [ "${#topic}" -lt 12 ]; then
+    warn "TESLA_NTFY_TOPIC is short; it acts as a password on public ntfy.sh"
+  fi
 
-if [ -n "$(env_get TESLA_NTFY_TOKEN || true)" ]; then
-  info "ntfy token: set"
-fi
-if [ -n "$(env_get TESLA_NTFY_URL || true)" ]; then
-  info "ntfy url: $(env_get TESLA_NTFY_URL || true)"
+  if [ -n "$(env_get TESLA_NTFY_TOKEN || true)" ]; then
+    info "ntfy token: set"
+  fi
+  if [ -n "$(env_get TESLA_NTFY_URL || true)" ]; then
+    info "ntfy url: $(env_get TESLA_NTFY_URL || true)"
+  fi
 fi
 if [ -n "$(env_get SSH || true)" ] || [ -n "$(env_get SSH_SUDO || true)" ]; then
-  warn "$ENV_FILE contains SSH/SSH_SUDO; only TESLA_* and NTFY_* keys will be copied"
+  warn "$ENV_FILE contains SSH/SSH_SUDO; only TESLA_* keys will be copied"
 fi
 
 HAVE_KEY=0
@@ -380,13 +415,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for key in TESLA_CLIENT_ID TESLA_CLIENT_SECRET TESLA_REDIRECT_URI TESLA_NTFY_TOPIC TESLA_NTFY_TOKEN TESLA_NTFY_URL; do
+for key in TESLA_CLIENT_ID TESLA_CLIENT_SECRET TESLA_REDIRECT_URI TESLA_NTFY_TOPIC TESLA_NTFY_TOKEN TESLA_NTFY_URL TESLA_PUSHOVER_TOKEN TESLA_PUSHOVER_USER TESLA_PUSHOVER_URL; do
   line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$ENV_FILE" 2>/dev/null | tail -n1 || true)"
   if [ -n "$line" ]; then
     printf '%s\n' "${line%$'\r'}" >> "$TMP_ENV"
   fi
 done
-for key in TESLA_CLIENT_ID TESLA_CLIENT_SECRET TESLA_REDIRECT_URI TESLA_NTFY_TOPIC; do
+for key in TESLA_CLIENT_ID TESLA_CLIENT_SECRET TESLA_REDIRECT_URI $REQUIRED_NOTIFY_KEYS; do
   grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$TMP_ENV" \
     || die "could not build the app .env: $key missing"
 done
@@ -519,10 +554,10 @@ fi
 printf '%s\n' "$last_logs" | tail -n 20
 
 if [ "$TEST_NOTIFY" -eq 1 ]; then
-  say "Sending a remote ntfy test"
+  say "Sending a remote notification test"
   if ! ssh "${SSH_OPTS[@]}" "$SERVER" \
     "cd ~/$TESLA_DIR && docker compose exec -T tesla tesla notify test"; then
-    die "remote notify test failed; check TESLA_NTFY_TOPIC/URL in ~/$TESLA_DIR/config/tesla/.env"
+    die "remote notify test failed; check the $NOTIFY_SERVICE settings in ~/$TESLA_DIR/config/tesla/.env"
   fi
 fi
 

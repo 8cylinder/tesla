@@ -688,6 +688,29 @@ def test_notify_test_missing_topic_exits_2(config_dir, tmp_path, monkeypatch):
     assert "TESLA_NTFY_TOPIC" in combined(result)
 
 
+def test_notify_test_pushover_missing_keys_exits_2(
+    config_dir, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    assert (
+        invoke(
+            config_dir, "config", "set", "notify.service", "pushover"
+        ).exit_code
+        == 0
+    )
+    assert (
+        invoke(config_dir, "config", "set", "notify.enabled", "true").exit_code
+        == 0
+    )
+    monkeypatch.delenv("TESLA_PUSHOVER_TOKEN", raising=False)
+    monkeypatch.delenv("TESLA_PUSHOVER_USER", raising=False)
+    result = invoke(config_dir, "notify", "test")
+    assert result.exit_code == 2
+    output = combined(result)
+    assert "TESLA_PUSHOVER_TOKEN" in output
+    assert "TESLA_PUSHOVER_USER" in output
+
+
 def test_notify_test_sends(config_dir, monkeypatch):
     class FakeNotifier:
         def __init__(self):

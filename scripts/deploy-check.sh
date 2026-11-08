@@ -15,6 +15,7 @@
 #   TESLA_SERVER       destination ssh host (default: <DEPLOY-SERVER>)
 #   XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
 #   TESLA_NTFY_URL     override ntfy URL for the reachability check
+#   TESLA_PUSHOVER_URL override Pushover URL for the reachability check
 #   TESLA_FLEET_URL    override Fleet API URL for the reachability check
 #
 # Exit status: 0 when there are no FAIL items (warnings are allowed).
@@ -54,6 +55,7 @@ Env:
   TESLA_SERVER       destination ssh host (default: <DEPLOY-SERVER>)
   XDG_CONFIG_HOME    config root on Linux (default: ~/.config)
   TESLA_NTFY_URL     override ntfy URL for the reachability check
+  TESLA_PUSHOVER_URL override Pushover URL for the reachability check
   TESLA_FLEET_URL    override Fleet API URL for the reachability check
 EOF
 }
@@ -284,7 +286,9 @@ CFG_REGION="na"
 CFG_DOMAIN=""
 CFG_SITE_ID=""
 CFG_NOTIFY_ENABLED="false"
-CFG_NOTIFY_URL="https://ntfy.sh"
+CFG_NOTIFY_SERVICE="ntfy"
+CFG_NTFY_URL="https://ntfy.sh"
+CFG_PUSHOVER_URL="https://api.pushover.net/1/messages.json"
 CFG_NOTIFY_PRIORITY="3"
 CFG_NOTIFY_MIN_PRIORITY="1"
 CFG_KEY_PATH=""
@@ -322,13 +326,24 @@ def emit(key, value):
 
 powerwall = table("powerwall")
 notify = table("notify")
+ntfy = notify.get("ntfy") if isinstance(notify.get("ntfy"), dict) else {}
+pushover = (
+    notify.get("pushover")
+    if isinstance(notify.get("pushover"), dict)
+    else {}
+)
 vehicle = table("vehicle")
 
 emit("region", cfg.get("region", "na"))
 emit("domain", cfg.get("domain"))
 emit("site_id", powerwall.get("energy_site_id"))
 emit("notify_enabled", "true" if notify.get("enabled") is True else "false")
-emit("notify_url", notify.get("url", "https://ntfy.sh"))
+emit("notify_service", notify.get("service", "ntfy"))
+emit("ntfy_url", ntfy.get("url") or notify.get("url", "https://ntfy.sh"))
+emit(
+    "pushover_url",
+    pushover.get("url", "https://api.pushover.net/1/messages.json"),
+)
 emit("notify_priority", notify.get("priority", 3))
 emit("notify_min_priority", notify.get("min_priority", 1))
 emit("key_path", vehicle.get("key_path"))
@@ -344,7 +359,9 @@ PY
   CFG_DOMAIN="$(cfg_get domain)"
   CFG_SITE_ID="$(cfg_get site_id)"
   CFG_NOTIFY_ENABLED="$(cfg_get notify_enabled)"
-  CFG_NOTIFY_URL="$(cfg_get notify_url)"
+  CFG_NOTIFY_SERVICE="$(cfg_get notify_service)"
+  CFG_NTFY_URL="$(cfg_get ntfy_url)"
+  CFG_PUSHOVER_URL="$(cfg_get pushover_url)"
   CFG_NOTIFY_PRIORITY="$(cfg_get notify_priority)"
   CFG_NOTIFY_MIN_PRIORITY="$(cfg_get notify_min_priority)"
   CFG_KEY_PATH="$(cfg_get key_path)"
@@ -352,9 +369,17 @@ PY
 
 load_config_values
 
-NTFY_URL="${TESLA_NTFY_URL:-}"
-[ -n "$NTFY_URL" ] || NTFY_URL="$CFG_NOTIFY_URL"
-[ -n "$NTFY_URL" ] || NTFY_URL="https://ntfy.sh"
+if [ "$CFG_NOTIFY_SERVICE" = "pushover" ]; then
+  NOTIFY_URL="${TESLA_PUSHOVER_URL:-}"
+  [ -n "$NOTIFY_URL" ] || NOTIFY_URL="$CFG_PUSHOVER_URL"
+  [ -n "$NOTIFY_URL" ] || NOTIFY_URL="https://api.pushover.net/1/messages.json"
+  REQUIRED_NOTIFY_KEYS="TESLA_PUSHOVER_TOKEN TESLA_PUSHOVER_USER"
+else
+  NOTIFY_URL="${TESLA_NTFY_URL:-}"
+  [ -n "$NOTIFY_URL" ] || NOTIFY_URL="$CFG_NTFY_URL"
+  [ -n "$NOTIFY_URL" ] || NOTIFY_URL="https://ntfy.sh"
+  REQUIRED_NOTIFY_KEYS="TESLA_NTFY_TOPIC"
+fi
 
 FLEET_URL="${TESLA_FLEET_URL:-}"
 if [ -z "$FLEET_URL" ]; then
@@ -507,10 +532,25 @@ if [ "$DO_LOCAL" -eq 1 ]; then
         *) fail "notify.min_priority must be 1-5 (got '${CFG_NOTIFY_MIN_PRIORITY:-unset}')" ;;
       esac
 
-      if [ -n "$CFG_NOTIFY_URL" ]; then
-        pass "notify.url=$CFG_NOTIFY_URL"
+      case "$CFG_NOTIFY_SERVICE" in
+        ntfy|pushover) pass "notify.service=$CFG_NOTIFY_SERVICE" ;;
+        *)
+          fail "notify.service must be ntfy or pushover (got '${CFG_NOTIFY_SERVICE:-unset}')"
+          ;;
+      esac
+
+      if [ "$CFG_NOTIFY_SERVICE" = "pushover" ]; then
+        if [ -n "$CFG_PUSHOVER_URL" ]; then
+          pass "notify.pushover.url=$CFG_PUSHOVER_URL"
+        else
+          fail "notify.pushover.url must not be empty"
+        fi
       else
-        fail "notify.url must not be empty"
+        if [ -n "$CFG_NTFY_URL" ]; then
+          pass "notify.ntfy.url=$CFG_NTFY_URL"
+        else
+          fail "notify.ntfy.url must not be empty"
+        fi
       fi
     fi
   fi
@@ -524,7 +564,7 @@ if [ "$DO_LOCAL" -eq 1 ]; then
       fail ".env is tracked by git; remove it from the index and history"
     fi
 
-    for key in TESLA_CLIENT_ID TESLA_CLIENT_SECRET TESLA_REDIRECT_URI TESLA_NTFY_TOPIC; do
+    for key in TESLA_CLIENT_ID TESLA_CLIENT_SECRET TESLA_REDIRECT_URI $REQUIRED_NOTIFY_KEYS; do
       value="$(env_get "$key" || true)"
       if [ -z "$value" ]; then
         fail "$key is missing or empty in $ENV_FILE"
@@ -546,31 +586,43 @@ if [ "$DO_LOCAL" -eq 1 ]; then
       esac
     done
 
-    topic="$(env_get TESLA_NTFY_TOPIC || true)"
-    case "$topic" in
-      '') ;;
-      *'<unguessable>'*)
-        fail "TESLA_NTFY_TOPIC still has the example placeholder"
-        ;;
-      *)
-        if [ "${#topic}" -lt 12 ]; then
-          warn "TESLA_NTFY_TOPIC is short; use a hard-to-guess topic (it acts as a password)"
-        else
-          pass "TESLA_NTFY_TOPIC looks non-trivial"
-        fi
-        ;;
-    esac
+    if [ "$CFG_NOTIFY_SERVICE" = "pushover" ]; then
+      if [ -n "$(env_get TESLA_PUSHOVER_TOKEN || true)" ]; then
+        pass "TESLA_PUSHOVER_TOKEN is set"
+      fi
+      if [ -n "$(env_get TESLA_PUSHOVER_USER || true)" ]; then
+        pass "TESLA_PUSHOVER_USER is set"
+      fi
+      if [ -n "$(env_get TESLA_PUSHOVER_URL || true)" ]; then
+        pass "TESLA_PUSHOVER_URL is set: $(env_get TESLA_PUSHOVER_URL || true)"
+      fi
+    else
+      topic="$(env_get TESLA_NTFY_TOPIC || true)"
+      case "$topic" in
+        '') ;;
+        *'<unguessable>'*)
+          fail "TESLA_NTFY_TOPIC still has the example placeholder"
+          ;;
+        *)
+          if [ "${#topic}" -lt 12 ]; then
+            warn "TESLA_NTFY_TOPIC is short; use a hard-to-guess topic (it acts as a password)"
+          else
+            pass "TESLA_NTFY_TOPIC looks non-trivial"
+          fi
+          ;;
+      esac
 
-    if [ -n "$(env_get TESLA_NTFY_TOKEN || true)" ]; then
-      pass "TESLA_NTFY_TOKEN is set (protected/self-hosted ntfy)"
-    fi
-    if [ -n "$(env_get TESLA_NTFY_URL || true)" ]; then
-      pass "TESLA_NTFY_URL is set: $(env_get TESLA_NTFY_URL || true)"
+      if [ -n "$(env_get TESLA_NTFY_TOKEN || true)" ]; then
+        pass "TESLA_NTFY_TOKEN is set (protected/self-hosted ntfy)"
+      fi
+      if [ -n "$(env_get TESLA_NTFY_URL || true)" ]; then
+        pass "TESLA_NTFY_URL is set: $(env_get TESLA_NTFY_URL || true)"
+      fi
     fi
 
     if [ -n "$(env_get SSH || true)" ] || [ -n "$(env_get SSH_SUDO || true)" ]; then
       warn "app .env contains SSH/SSH_SUDO; do not copy it verbatim to the server"
-      info "create a minimal ~/tesla/config/tesla/.env with only TESLA_* and NTFY_* keys"
+      info "create a minimal ~/tesla/config/tesla/.env with only TESLA_* keys"
     fi
 
     redirect_uri="$(env_get TESLA_REDIRECT_URI || true)"
@@ -588,7 +640,7 @@ if [ "$DO_LOCAL" -eq 1 ]; then
     pass "no local tesla watcher is running"
   fi
 
-  check_http "ntfy" "$NTFY_URL" optional
+  check_http "$CFG_NOTIFY_SERVICE" "$NOTIFY_URL" optional
   check_http "Tesla Fleet API" "$FLEET_URL" optional
   check_http "ghcr.io (Docker base image)" "https://ghcr.io/v2/" optional
 fi
@@ -610,7 +662,7 @@ if [ "$DO_REMOTE" -eq 1 ]; then
 
   if [ "$remote_ok" -eq 1 ]; then
     remote_raw="$(ssh "${SSH_OPTS[@]}" "$SERVER" \
-      env NTFY_URL="$NTFY_URL" FLEET_URL="$FLEET_URL" bash -s <<'REMOTE' 2>/dev/null
+      env NOTIFY_URL="$NOTIFY_URL" FLEET_URL="$FLEET_URL" bash -s <<'REMOTE' 2>/dev/null
 echo "host=$(hostname 2>/dev/null || echo unknown)"
 echo "arch=$(uname -m 2>/dev/null || echo unknown)"
 echo "docker_ok=$(docker info >/dev/null 2>&1 && echo yes || echo no)"
@@ -634,10 +686,10 @@ echo "docker_active=$(systemctl is-active docker 2>/dev/null || echo unknown)"
 echo "container_status=$(docker inspect -f '{{.State.Status}}' tesla-app 2>/dev/null || echo absent)"
 echo "curl_ok=$(command -v curl >/dev/null 2>&1 && echo yes || echo no)"
 if command -v curl >/dev/null 2>&1; then
-  echo "ntfy_http=$(curl -q -sS -o /dev/null -w '%{http_code}' --max-time 10 "$NTFY_URL" 2>/dev/null || echo err)"
+  echo "notify_http=$(curl -q -sS -o /dev/null -w '%{http_code}' --max-time 10 "$NOTIFY_URL" 2>/dev/null || echo err)"
   echo "fleet_http=$(curl -q -sS -o /dev/null -w '%{http_code}' --max-time 10 "$FLEET_URL" 2>/dev/null || echo err)"
 else
-  echo "ntfy_http=no-curl"
+  echo "notify_http=no-curl"
   echo "fleet_http=no-curl"
 fi
 echo "tar_ok=$(command -v tar >/dev/null 2>&1 && echo yes || echo no)"
@@ -843,7 +895,7 @@ REMOTE
         warn "curl is missing on the server; network reachability was not checked"
       fi
 
-      check_remote_http "ntfy" "$(rget ntfy_http)" "$NTFY_URL"
+      check_remote_http "$CFG_NOTIFY_SERVICE" "$(rget notify_http)" "$NOTIFY_URL"
       check_remote_http "Tesla Fleet API" "$(rget fleet_http)" "$FLEET_URL"
     fi
   fi

@@ -81,7 +81,7 @@ from .config import (
     tokens_path,
 )
 from .logging import setup_logging
-from .notify import NotifyError, NtfyNotifier, build_notifier
+from .notify import Notifier, NotifyError, build_notifier
 from .powerwall import backup_reserve, grid_status, percentage_charged
 from .server import (
     ContainerInfo,
@@ -517,13 +517,13 @@ def auth_logout() -> None:
 
 @cli.group()
 def notify() -> None:
-    """Configure and test ntfy notifications."""
+    """Configure and test notifications."""
 
 
 @notify.command("test")
 @click.option("--message", default="test notification from the tesla CLI")
 def notify_test(message: str) -> None:
-    """Send a test notification using the configured ntfy topic."""
+    """Send a test notification using the configured service."""
     with _api_errors():
         config = _config()
         if not config.notify.enabled:
@@ -541,7 +541,7 @@ def notify_test(message: str) -> None:
             notifier.send("test", message, title="tesla notify test")
         )
     if not ok:
-        _fail("failed to send; check the URL/topic and logs", 3)
+        _fail("failed to send; check the service settings and logs", 3)
     console.print("[green]notification sent[/green]")
 
 
@@ -738,7 +738,7 @@ def _estimate_eta(
 
 
 async def _notify_on_level(
-    notifier: NtfyNotifier,
+    notifier: Notifier,
     read_pct: Callable[[], Awaitable[float | None]],
     *,
     level: float,
@@ -1201,14 +1201,32 @@ def doctor() -> None:
             )
             sources.append(("private_key.pem", path, ""))
         if config.notify.enabled:
-            topic = env_value("TESLA_NTFY_TOPIC")
-            rows.append(
-                (
-                    "notify",
-                    bool(topic),
-                    "topic set" if topic else "TESLA_NTFY_TOPIC not set",
+            if config.notify.service == "pushover":
+                missing = [
+                    name
+                    for name in (
+                        "TESLA_PUSHOVER_TOKEN",
+                        "TESLA_PUSHOVER_USER",
+                    )
+                    if not env_value(name)
+                ]
+                note = (
+                    "pushover configured"
+                    if not missing
+                    else f"{', '.join(missing)} not set"
                 )
-            )
+                rows.append(("notify", not missing, note))
+            else:
+                topic = env_value("TESLA_NTFY_TOPIC")
+                rows.append(
+                    (
+                        "notify",
+                        bool(topic),
+                        "ntfy topic set"
+                        if topic
+                        else "TESLA_NTFY_TOPIC not set",
+                    )
+                )
         else:
             rows.append(("notify", True, "disabled"))
 

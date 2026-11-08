@@ -31,6 +31,10 @@ Typical paths:
 - `TESLA_REDIRECT_URI`: OAuth redirect URI; defaults to
   `http://localhost:8085/callback`.
 - `TESLA_NTFY_TOPIC`, `TESLA_NTFY_TOKEN`, `TESLA_NTFY_URL`: ntfy settings.
+- `TESLA_PUSHOVER_TOKEN`, `TESLA_PUSHOVER_USER`,
+  `TESLA_PUSHOVER_URL`: Pushover application token, user/group key, and
+  optional API URL. The token and user key are secrets; keep them in the
+  environment or `.env`.
 - `NO_COLOR`, `FORCE_COLOR`, `TERM`: color detection when
   `--color=auto`. `--color` takes precedence over both variables.
 - `BASH_COMPLETION_USER_DIR`, `XDG_DATA_HOME`, `HOME`: completion

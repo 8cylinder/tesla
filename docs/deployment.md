@@ -44,7 +44,7 @@ TESLA_SERVER="<DEPLOY-SERVER>" scripts/deploy-initial.sh
 ```
 
 It refuses to overwrite existing server state unless `--force` is given,
-supports `--dry-run`, and sends one remote ntfy test unless
+supports `--dry-run`, and sends one remote notification test unless
 `--no-test-notify` is used. Use `scripts/deploy.sh` for later updates.
 
 Run `scripts/deploy-check.sh` first if you are unsure which path applies:
@@ -71,7 +71,7 @@ or `deploy.sh` accordingly.
        "$state/private_key.pem" <ssh-host>:tesla/config/tesla/
 
    # Build a minimal app .env; do not copy SSH/SSH_SUDO keys.
-   grep -E '^(TESLA_CLIENT_ID|TESLA_CLIENT_SECRET|TESLA_REDIRECT_URI|TESLA_NTFY_TOPIC|TESLA_NTFY_TOKEN|TESLA_NTFY_URL)=' .env \
+   grep -E '^(TESLA_CLIENT_ID|TESLA_CLIENT_SECRET|TESLA_REDIRECT_URI|TESLA_NTFY_TOPIC|TESLA_NTFY_TOKEN|TESLA_NTFY_URL|TESLA_PUSHOVER_TOKEN|TESLA_PUSHOVER_USER|TESLA_PUSHOVER_URL)=' .env \
        > /tmp/tesla-app.env
    scp /tmp/tesla-app.env <ssh-host>:tesla/config/tesla/.env
    rm /tmp/tesla-app.env

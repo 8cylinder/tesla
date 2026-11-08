@@ -5,7 +5,14 @@ import aiohttp
 import pytest
 
 from tesla.config import Config
-from tesla.notify import NotifyError, NotifyState, NtfyNotifier, build_notifier
+from tesla.notify import (
+    NotifyError,
+    NotifyState,
+    NtfyNotifier,
+    PushoverNotifier,
+    build_notifier,
+    pushover_priority,
+)
 
 
 class FakeResponse:
@@ -33,8 +40,10 @@ class FakeSession:
     async def __aexit__(self, *exc):
         return False
 
-    def post(self, url, json=None, headers=None):
-        self.posts.append({"url": url, "json": json, "headers": headers})
+    def post(self, url, json=None, data=None, headers=None):
+        self.posts.append(
+            {"url": url, "json": json, "data": data, "headers": headers}
+        )
         return FakeResponse(FakeSession.status)
 
 
@@ -65,7 +74,8 @@ def test_build_notifier_missing_topic(config_dir, tmp_path, monkeypatch):
 
 
 def test_build_notifier_env_values(config_dir):
-    config = make_config(enabled=True, url="https://config.example")
+    config = make_config(enabled=True)
+    config.notify.ntfy.url = "https://config.example"
     notifier = build_notifier(
         config,
         environ={
@@ -75,9 +85,61 @@ def test_build_notifier_env_values(config_dir):
         },
     )
     assert notifier is not None
+    assert isinstance(notifier, NtfyNotifier)
     assert notifier.topic == "topic"
     assert notifier.url == "https://env.example"
     assert notifier.token == "tk_x"
+
+
+def test_build_notifier_ntfy_uses_config_url(config_dir):
+    config = make_config(enabled=True)
+    config.notify.ntfy.url = "https://config.example/"
+    notifier = build_notifier(config, environ={"TESLA_NTFY_TOPIC": "topic"})
+    assert notifier is not None
+    assert isinstance(notifier, NtfyNotifier)
+    assert notifier.url == "https://config.example"
+
+
+def test_build_notifier_pushover_missing_keys(config_dir):
+    config = make_config(enabled=True, service="pushover")
+    with pytest.raises(NotifyError, match="TESLA_PUSHOVER_TOKEN"):
+        build_notifier(config, environ={"TESLA_PUSHOVER_USER": "user"})
+    with pytest.raises(NotifyError, match="TESLA_PUSHOVER_USER"):
+        build_notifier(config, environ={"TESLA_PUSHOVER_TOKEN": "token"})
+    with pytest.raises(NotifyError, match="TESLA_PUSHOVER"):
+        build_notifier(config, environ={})
+
+
+def test_build_notifier_pushover_env_values(config_dir):
+    config = make_config(enabled=True, service="pushover")
+    config.notify.pushover.url = "https://config.example/messages.json"
+    notifier = build_notifier(
+        config,
+        environ={
+            "TESLA_PUSHOVER_TOKEN": "app-token",
+            "TESLA_PUSHOVER_USER": "user-key",
+            "TESLA_PUSHOVER_URL": "https://env.example/messages.json",
+        },
+    )
+    assert notifier is not None
+    assert isinstance(notifier, PushoverNotifier)
+    assert notifier.token == "app-token"
+    assert notifier.user == "user-key"
+    assert notifier.url == "https://env.example/messages.json"
+
+
+def test_build_notifier_pushover_config_url(config_dir):
+    config = make_config(enabled=True, service="pushover")
+    config.notify.pushover.url = "https://config.example/messages.json/"
+    notifier = build_notifier(
+        config,
+        environ={
+            "TESLA_PUSHOVER_TOKEN": "app-token",
+            "TESLA_PUSHOVER_USER": "user-key",
+        },
+    )
+    assert notifier is not None
+    assert notifier.url == "https://config.example/messages.json"
 
 
 async def test_send_posts_json(config_dir):
@@ -96,6 +158,60 @@ async def test_send_posts_json(config_dir):
         "tags": ["tesla", "powerwall", "zap"],
     }
     assert post["headers"]["Authorization"] == "Bearer tk_secret"
+
+
+async def test_pushover_send_posts_form(config_dir):
+    config = make_config(enabled=True, service="pushover")
+    config.notify.pushover.device = "iphone"
+    config.notify.pushover.sound = "siren"
+    notifier = PushoverNotifier(config.notify, "user-key", "app-token")
+    assert await notifier.send(
+        "charging", "charging started", priority=4, tags=("zap",)
+    )
+    post = FakeSession.instances[-1].posts[-1]
+    assert post["url"] == "https://api.pushover.net/1/messages.json"
+    assert post["json"] is None
+    assert post["data"] == {
+        "token": "app-token",
+        "user": "user-key",
+        "message": "charging started",
+        "title": "tesla",
+        "priority": "1",
+        "device": "iphone",
+        "sound": "siren",
+    }
+
+
+async def test_pushover_http_error_returns_false(config_dir):
+    FakeSession.status = 400
+    notifier = PushoverNotifier(
+        make_config(enabled=True, service="pushover").notify,
+        "user-key",
+        "app-token",
+    )
+    assert await notifier.send("started", "hi") is False
+
+
+async def test_pushover_network_error_returns_false(config_dir, monkeypatch):
+    class BoomSession(FakeSession):
+        def post(self, url, json=None, data=None, headers=None):
+            raise aiohttp.ClientError("boom")
+
+    monkeypatch.setattr("tesla.notify.aiohttp.ClientSession", BoomSession)
+    notifier = PushoverNotifier(
+        make_config(enabled=True, service="pushover").notify,
+        "user-key",
+        "app-token",
+    )
+    assert await notifier.send("started", "hi") is False
+
+
+@pytest.mark.parametrize(
+    ("priority", "expected"),
+    [(1, -2), (2, -1), (3, 0), (4, 1), (5, 1)],
+)
+def test_pushover_priority_mapping(priority, expected):
+    assert pushover_priority(priority) == expected
 
 
 async def test_send_http_error_returns_false(config_dir):

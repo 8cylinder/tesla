@@ -37,7 +37,7 @@ from .car import charging_state as read_charging_state
 from .car import vehicle_status as read_vehicle_status
 from .client import build_vehicle, ensure_fresh_token
 from .config import Config, ConfigError
-from .notify import NtfyNotifier
+from .notify import Notifier
 from .powerwall import percentage_charged
 
 LOGGER = logging.getLogger(__name__)
@@ -315,7 +315,7 @@ class AutoCharger:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         jitter: Callable[[float, float], float] = random.uniform,
-        notifier: NtfyNotifier | None = None,
+        notifier: Notifier | None = None,
     ) -> None:
         self.client = client
         self.auto = config.auto_charge
@@ -1031,7 +1031,7 @@ async def watch(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], float] = time.monotonic,
     jitter: Callable[[float, float], float] = random.uniform,
-    notifier: NtfyNotifier | None = None,
+    notifier: Notifier | None = None,
 ) -> int:
     """Poll and trigger once; returns the process exit code (0/2/3)."""
     charger = AutoCharger(
@@ -1053,7 +1053,7 @@ async def run(
     *,
     dry_run: bool = False,
     once: bool = False,
-    notifier: NtfyNotifier | None = None,
+    notifier: Notifier | None = None,
 ) -> int:
     """Run the watch loop with SIGINT/SIGTERM handling; returns exit code."""
     loop = asyncio.get_running_loop()

@@ -21,6 +21,7 @@ import platformdirs
 APP = "tesla"
 COMMAND_MODES = ("signed", "fleet")
 REGIONS = ("na", "eu", "cn")
+NOTIFY_SERVICES = ("ntfy", "pushover")
 
 
 class ConfigError(Exception):
@@ -74,14 +75,28 @@ class AutoChargeConfig:
 
 
 @dataclass
+class NtfyConfig:
+    url: str = "https://ntfy.sh"
+
+
+@dataclass
+class PushoverConfig:
+    url: str = "https://api.pushover.net/1/messages.json"
+    device: str = ""
+    sound: str = ""
+
+
+@dataclass
 class NotifyConfig:
     enabled: bool = False
-    url: str = "https://ntfy.sh"
+    service: str = "ntfy"
     priority: int = 3
     tags: str = "tesla"
     min_priority: int = 1
     verbose: bool = False
     on_start: bool = True
+    ntfy: NtfyConfig = field(default_factory=NtfyConfig)
+    pushover: PushoverConfig = field(default_factory=PushoverConfig)
 
 
 @dataclass
@@ -140,12 +155,20 @@ _SCHEMA: dict[str, Any] = {
     },
     "notify": {
         "enabled": bool,
-        "url": str,
+        "service": str,
         "priority": int,
         "tags": str,
         "min_priority": int,
         "verbose": bool,
         "on_start": bool,
+        "ntfy": {
+            "url": str,
+        },
+        "pushover": {
+            "url": str,
+            "device": str,
+            "sound": str,
+        },
     },
     "server": {
         "url": str,
@@ -221,14 +244,28 @@ def _check_values(config: Config) -> None:
         raise ConfigError(
             "auto_charge.stop_margin must be less than auto_charge.threshold"
         )
+    if config.notify.service not in NOTIFY_SERVICES:
+        services = ", ".join(NOTIFY_SERVICES)
+        raise ConfigError(f"notify.service must be one of: {services}")
     if not 1 <= config.notify.priority <= 5:
         raise ConfigError("notify.priority must be in [1, 5]")
     if not 1 <= config.notify.min_priority <= 5:
         raise ConfigError("notify.min_priority must be in [1, 5]")
-    if not config.notify.url:
-        raise ConfigError("notify.url must not be empty")
+    if not config.notify.ntfy.url:
+        raise ConfigError("notify.ntfy.url must not be empty")
+    if not config.notify.pushover.url:
+        raise ConfigError("notify.pushover.url must not be empty")
     if config.server.url is not None and not config.server.url.strip():
         raise ConfigError("server.url must not be empty")
+
+
+def _apply(target: Any, values: dict[str, Any]) -> None:  # noqa: ANN401
+    for key, value in values.items():
+        current = getattr(target, key)
+        if isinstance(value, dict):
+            _apply(current, value)
+        else:
+            setattr(target, key, value)
 
 
 def _build(
@@ -236,22 +273,29 @@ def _build(
     path: Path,
     unknown: list[str],
 ) -> Config:
+    data = dict(data)
+    notify_raw = data.get("notify")
+    legacy_url: str | None = None
+    if isinstance(notify_raw, dict) and "url" in notify_raw:
+        # Older configs kept the ntfy URL directly under [notify].
+        notify_raw = dict(notify_raw)
+        raw_url = notify_raw.pop("url")
+        if not isinstance(raw_url, str):
+            raise ConfigError(
+                f"'notify.url' must be {_type_name(str)}, "
+                f"got {type(raw_url).__name__}"
+            )
+        legacy_url = raw_url
+        data["notify"] = notify_raw
     cleaned = _clean("", data, _SCHEMA, unknown)
     config = Config(
         region=cleaned.get("region", "na"),
         domain=cleaned.get("domain"),
         source_path=path,
     )
-    for key, value in (cleaned.get("vehicle") or {}).items():
-        setattr(config.vehicle, key, value)
-    for key, value in (cleaned.get("powerwall") or {}).items():
-        setattr(config.powerwall, key, value)
-    for key, value in (cleaned.get("auto_charge") or {}).items():
-        setattr(config.auto_charge, key, value)
-    for key, value in (cleaned.get("notify") or {}).items():
-        setattr(config.notify, key, value)
-    for key, value in (cleaned.get("server") or {}).items():
-        setattr(config.server, key, value)
+    if legacy_url is not None:
+        config.notify.ntfy.url = legacy_url
+    _apply(config, cleaned)
     _check_values(config)
     return config
 
@@ -285,15 +329,12 @@ def load_config(
 
 
 def _schema_for(dotted: str) -> Any:  # noqa: ANN401
-    parts = dotted.split(".")
-    if len(parts) == 1:
-        expected = _SCHEMA.get(parts[0])
-        return expected if isinstance(expected, type) else None
-    if len(parts) == 2:
-        section = _SCHEMA.get(parts[0])
-        if isinstance(section, dict):
-            return section.get(parts[1])
-    return None
+    node: Any = _SCHEMA
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node if isinstance(node, type) else None
 
 
 def get_dotted(config: Config, dotted: str) -> Any:  # noqa: ANN401
@@ -377,15 +418,24 @@ def dump_toml(config: Config) -> str:
         "",
         "[notify]",
         f"enabled = {_toml(config.notify.enabled)}",
-        f"url = {_toml(config.notify.url)}",
+        f"service = {_toml(config.notify.service)}",
         f"priority = {_toml(config.notify.priority)}",
         f"tags = {_toml(config.notify.tags)}",
         f"min_priority = {_toml(config.notify.min_priority)}",
         f"verbose = {_toml(config.notify.verbose)}",
         f"on_start = {_toml(config.notify.on_start)}",
         "",
-        "[server]",
+        "[notify.ntfy]",
+        f"url = {_toml(config.notify.ntfy.url)}",
+        "",
+        "[notify.pushover]",
+        f"url = {_toml(config.notify.pushover.url)}",
     ]
+    if config.notify.pushover.device:
+        lines.append(f"device = {_toml(config.notify.pushover.device)}")
+    if config.notify.pushover.sound:
+        lines.append(f"sound = {_toml(config.notify.pushover.sound)}")
+    lines += ["", "[server]"]
     if config.server.url is not None:
         lines.append(f"url = {_toml(config.server.url)}")
     return "\n".join(lines) + "\n"
